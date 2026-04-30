@@ -1,0 +1,9 @@
+repos:
+  - repo: local
+    hooks:
+      - id: local-cli-delegation-gate
+        name: local-cli delegation unit/regression/e2e/coverage/performance gate
+        entry: python scripts/pre_commit_local_cli_gate.py
+        language: system
+        pass_filenames: false
+        files: ^(agent/local_cli_client\.py|tools/delegate_tool\.py|run_agent\.py|agent/auxiliary_client\.py|tests/agent/test_local_cli_client\.py|tests/tools/test_delegate\.py|scripts/pre_commit_local_cli_gate\.py|\.pre-commit-config\.yaml)$

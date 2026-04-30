@@ -12,6 +12,7 @@ Run with:  python -m pytest tests/test_delegate.py -v
 import json
 import os
 import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -1177,6 +1178,38 @@ class TestDelegationProviderIntegration(unittest.TestCase):
             self.assertEqual(kwargs["api_mode"], "chat_completions")
             self.assertEqual(kwargs["acp_command"], "claude")
             self.assertEqual(kwargs["acp_args"], ["--acp", "--stdio"])
+
+    @patch("tools.delegate_tool._load_config")
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    def test_explicit_claude_local_cli_delegate_e2e(self, mock_creds, mock_cfg):
+        """End-to-end delegate_task path executes the local CLI child and returns its output."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            fake_claude = os.path.join(tmp_dir, "claude")
+            with open(fake_claude, "w", encoding="utf-8") as f:
+                f.write("#!/usr/bin/env bash\nprintf 'CLAUDE_LOCAL_CLI_E2E_OK\\n'\n")
+            os.chmod(fake_claude, 0o755)
+            mock_cfg.return_value = {"max_iterations": 45, "model": "", "provider": ""}
+            mock_creds.return_value = {
+                "model": None,
+                "provider": None,
+                "base_url": None,
+                "api_key": None,
+                "api_mode": None,
+            }
+            parent = _make_mock_parent(depth=0)
+
+            result = json.loads(
+                delegate_task(
+                    goal="Reply exactly CLAUDE_LOCAL_CLI_E2E_OK",
+                    acp_command=fake_claude,
+                    acp_args=["--acp", "--stdio"],
+                    parent_agent=parent,
+                )
+            )
+
+        self.assertEqual(result["results"][0]["status"], "completed")
+        self.assertEqual(result["results"][0]["summary"], "CLAUDE_LOCAL_CLI_E2E_OK")
+        self.assertEqual(result["results"][0]["exit_reason"], "completed")
 
     @patch("tools.delegate_tool._load_config")
     @patch("tools.delegate_tool._resolve_delegation_credentials")
