@@ -359,6 +359,64 @@ class TestLoadGatewayConfig:
             "456": "Therapist mode",
         }
 
+    def test_compiles_discord_personas_to_runtime_maps(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            "discord:\n"
+            "  channel_prompts: {}\n"
+            "  channel_webhooks: {}\n"
+            "  personas:\n"
+            "    research:\n"
+            "      channels: [123, \"456\"]\n"
+            "      prompt: Research mode\n"
+            "      webhook_url: https://discord.com/api/webhooks/abc/def\n"
+            "      display_name: 세나 리서치\n"
+            "      skills: [arxiv]\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+        extra = config.platforms[Platform.DISCORD].extra
+
+        assert extra["channel_prompts"] == {
+            "123": "Research mode",
+            "456": "Research mode",
+        }
+        assert extra["channel_webhooks"]["123"]["url"] == "https://discord.com/api/webhooks/abc/def"
+        assert extra["channel_webhooks"]["456"]["username"] == "세나 리서치"
+        assert extra["channel_skill_bindings"] == {"123": ["arxiv"], "456": ["arxiv"]}
+
+    def test_discord_persona_low_level_overrides_generated_values(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            "discord:\n"
+            "  personas:\n"
+            "    research:\n"
+            "      channels: [123]\n"
+            "      prompt: Generated mode\n"
+            "      webhook_url: https://discord.com/api/webhooks/generated/token\n"
+            "  channel_prompts:\n"
+            "    123: Explicit mode\n"
+            "  channel_webhooks:\n"
+            "    123:\n"
+            "      url: https://discord.com/api/webhooks/explicit/token\n"
+            "      username: Explicit Sena\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+        extra = config.platforms[Platform.DISCORD].extra
+
+        assert extra["channel_prompts"]["123"] == "Explicit mode"
+        assert extra["channel_webhooks"]["123"]["url"] == "https://discord.com/api/webhooks/explicit/token"
+        assert extra["channel_webhooks"]["123"]["username"] == "Explicit Sena"
+
     def test_bridges_telegram_channel_prompts_from_config_yaml(self, tmp_path, monkeypatch):
         hermes_home = tmp_path / ".hermes"
         hermes_home.mkdir()
