@@ -948,6 +948,7 @@ class AIAgent:
         skip_context_files: bool = False,
         load_soul_identity: bool = False,
         skip_memory: bool = False,
+        suppress_memory_prompt: bool = False,
         session_db=None,
         parent_session_id: str = None,
         iteration_budget: "IterationBudget" = None,
@@ -1001,6 +1002,11 @@ class AIAgent:
             load_soul_identity (bool): If True, still use ~/.hermes/SOUL.md as the primary
                 identity even when skip_context_files=True. Project context files from the cwd
                 remain skipped.
+            skip_memory (bool): If True, do not initialize built-in or external memory providers.
+                This also makes the memory tool unavailable at runtime because there is no store.
+            suppress_memory_prompt (bool): If True, initialize memory providers/tools but do not
+                inject stored memory into the system prompt. Useful for autonomous cron jobs that
+                may need to write durable facts without reading user-profile context into the run.
         """
         _install_safe_stdio()
 
@@ -1030,6 +1036,7 @@ class AIAgent:
         self.background_review_callback = None  # Optional sync callback for gateway delivery
         self.skip_context_files = skip_context_files
         self.load_soul_identity = load_soul_identity
+        self.suppress_memory_prompt = suppress_memory_prompt
         self.pass_session_id = pass_session_id
         self._credential_pool = credential_pool
         self.log_prefix_chars = log_prefix_chars
@@ -4952,7 +4959,7 @@ class AIAgent:
         if system_message is not None:
             prompt_parts.append(system_message)
 
-        if self._memory_store:
+        if self._memory_store and not self.suppress_memory_prompt:
             if self._memory_enabled:
                 mem_block = self._memory_store.format_for_system_prompt("memory")
                 if mem_block:
@@ -4964,7 +4971,7 @@ class AIAgent:
                     prompt_parts.append(user_block)
 
         # External memory provider system prompt block (additive to built-in)
-        if self._memory_manager:
+        if self._memory_manager and not self.suppress_memory_prompt:
             try:
                 _ext_mem_block = self._memory_manager.build_system_prompt()
                 if _ext_mem_block:
