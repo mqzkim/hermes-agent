@@ -720,6 +720,8 @@ class TestRunJobSessionPersistence:
         kwargs = mock_agent_cls.call_args.kwargs
         assert kwargs["session_db"] is fake_db
         assert kwargs["platform"] == "cron"
+        assert kwargs["skip_memory"] is False
+        assert kwargs["suppress_memory_prompt"] is True
         assert kwargs["session_id"].startswith("cron_test-job_")
         fake_db.end_session.assert_called_once()
         call_args = fake_db.end_session.call_args

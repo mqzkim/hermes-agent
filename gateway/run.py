@@ -9265,6 +9265,17 @@ class GatewayRunner:
         ("compression", "threshold"),
         ("compression", "target_ratio"),
         ("compression", "protect_last_n"),
+        # Built-in memory and memory-provider state is baked into AIAgent at
+        # construction time.  If these change while the gateway is running,
+        # reusing a cached agent can leave ``_memory_store`` as None even
+        # though the live config/toolset now enables memory, yielding
+        # "Memory is not available" from tools.memory_tool.
+        ("memory", "memory_enabled"),
+        ("memory", "user_profile_enabled"),
+        ("memory", "memory_char_limit"),
+        ("memory", "user_char_limit"),
+        ("memory", "provider"),
+        ("memory", "nudge_interval"),
     )
 
     @classmethod
