@@ -48,6 +48,37 @@ DELEGATE_BLOCKED_TOOLS = frozenset(
 )
 
 
+def _normalized_command_name(command: str) -> str:
+    """Return a normalized executable stem for POSIX and Windows-style paths."""
+    raw = str(command or "").strip()
+    if not raw:
+        return ""
+    base = raw.replace("\\", "/").rsplit("/", 1)[-1]
+    lower = base.lower()
+    for suffix in (".exe", ".cmd", ".bat", ".ps1"):
+        if lower.endswith(suffix):
+            base = base[: -len(suffix)]
+            lower = lower[: -len(suffix)]
+            break
+    return lower
+
+
+def _resolve_explicit_command_transport(command: str) -> tuple[str, Optional[str], str]:
+    """Map explicit subagent command overrides to the transport Hermes can run.
+
+    Claude Code and Codex CLIs installed on this WSL host are local CLIs, not
+    ACP stdio servers: `claude --acp --stdio` and `codex --acp --stdio` fail.
+    Route those executable names through the local-cli adapter. Keep unknown
+    commands on the legacy Copilot ACP path so custom ACP servers still work.
+    """
+    name = _normalized_command_name(command)
+    if not name:
+        raise ValueError("acp_command must not be empty")
+    if name in {"claude", "codex"}:
+        return "local-cli", f"local-cli://{name}", "chat_completions"
+    return "copilot-acp", None, "chat_completions"
+
+
 # ---------------------------------------------------------------------------
 # Subagent approval callbacks
 # ---------------------------------------------------------------------------
@@ -1002,10 +1033,14 @@ def _build_child_agent(
         effective_acp_args = []
 
     if override_acp_command:
-        # If explicitly forcing an ACP transport override, the provider MUST be copilot-acp
-        # so run_agent.py initializes the CopilotACPClient.
-        effective_provider = "copilot-acp"
-        effective_api_mode = "chat_completions"
+        # Explicit Claude/Codex commands are local CLIs in this environment, not
+        # ACP stdio servers. Unknown custom commands keep the legacy Copilot ACP
+        # transport so third-party ACP runtimes still work.
+        effective_provider, resolved_base_url, effective_api_mode = _resolve_explicit_command_transport(
+            override_acp_command
+        )
+        if resolved_base_url is not None:
+            effective_base_url = resolved_base_url
 
     # Resolve reasoning config: delegation override > parent inherit
     parent_reasoning = getattr(parent_agent, "reasoning_config", None)

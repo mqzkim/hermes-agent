@@ -32,6 +32,7 @@ from tools.delegate_tool import (
     _strip_blocked_tools,
     _resolve_child_credential_pool,
     _resolve_delegation_credentials,
+    _resolve_explicit_command_transport,
 )
 
 
@@ -902,6 +903,35 @@ class TestDelegationCredentialResolution(unittest.TestCase):
         self.assertIsNone(creds["provider"])
 
 
+class TestExplicitCommandTransport(unittest.TestCase):
+    def test_claude_command_uses_local_cli_transport(self):
+        provider, base_url, api_mode = _resolve_explicit_command_transport("claude")
+
+        self.assertEqual(provider, "local-cli")
+        self.assertEqual(base_url, "local-cli://claude")
+        self.assertEqual(api_mode, "chat_completions")
+
+    def test_windows_codex_path_uses_local_cli_transport(self):
+        provider, base_url, api_mode = _resolve_explicit_command_transport(
+            r"C:\\Users\\mqz\\AppData\\Roaming\\npm\\codex.cmd"
+        )
+
+        self.assertEqual(provider, "local-cli")
+        self.assertEqual(base_url, "local-cli://codex")
+        self.assertEqual(api_mode, "chat_completions")
+
+    def test_custom_acp_command_keeps_copilot_transport(self):
+        provider, base_url, api_mode = _resolve_explicit_command_transport("custom-copilot")
+
+        self.assertEqual(provider, "copilot-acp")
+        self.assertEqual(base_url, None)
+        self.assertEqual(api_mode, "chat_completions")
+
+    def test_empty_command_is_rejected(self):
+        with self.assertRaises(ValueError):
+            _resolve_explicit_command_transport("  ")
+
+
 class TestDelegationProviderIntegration(unittest.TestCase):
     """Integration tests: delegation config → _run_single_child → AIAgent construction."""
 
@@ -1132,6 +1162,41 @@ class TestDelegationProviderIntegration(unittest.TestCase):
             self.assertEqual(kwargs.get("override_api_mode"), "chat_completions")
             self.assertEqual(kwargs.get("override_acp_command"), "custom-copilot")
             self.assertEqual(kwargs.get("override_acp_args"), ["--stdio-custom"])
+
+    @patch("tools.delegate_tool._load_config")
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    def test_explicit_claude_command_reaches_child_as_local_cli(self, mock_creds, mock_cfg):
+        """Installed Claude Code is a local CLI, not a Copilot ACP stdio server."""
+        mock_cfg.return_value = {"max_iterations": 45, "model": "", "provider": ""}
+        mock_creds.return_value = {
+            "model": None,
+            "provider": None,
+            "base_url": None,
+            "api_key": None,
+            "api_mode": None,
+        }
+        parent = _make_mock_parent(depth=0)
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.run_conversation.return_value = {
+                "final_response": "CLAUDE_OK", "completed": True, "api_calls": 1
+            }
+            MockAgent.return_value = mock_child
+
+            delegate_task(
+                goal="Reply exactly CLAUDE_OK",
+                acp_command="claude",
+                acp_args=["--acp", "--stdio"],
+                parent_agent=parent,
+            )
+
+            _, kwargs = MockAgent.call_args
+            self.assertEqual(kwargs["provider"], "local-cli")
+            self.assertEqual(kwargs["base_url"], "local-cli://claude")
+            self.assertEqual(kwargs["api_mode"], "chat_completions")
+            self.assertEqual(kwargs["acp_command"], "claude")
+            self.assertEqual(kwargs["acp_args"], ["--acp", "--stdio"])
 
     @patch("tools.delegate_tool._load_config")
     @patch("tools.delegate_tool._resolve_delegation_credentials")

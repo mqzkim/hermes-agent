@@ -1420,7 +1420,7 @@ class AIAgent:
                     client_kwargs = {"api_key": api_key, "base_url": base_url}
                 if _provider_timeout is not None:
                     client_kwargs["timeout"] = _provider_timeout
-                if self.provider == "copilot-acp":
+                if self.provider in {"copilot-acp", "local-cli"}:
                     client_kwargs["command"] = self.acp_command
                     client_kwargs["args"] = self.acp_args
                 effective_base = base_url
@@ -5516,6 +5516,17 @@ class AIAgent:
             client = CopilotACPClient(**client_kwargs)
             logger.info(
                 "Copilot ACP client created (%s, shared=%s) %s",
+                reason,
+                shared,
+                self._client_log_context(),
+            )
+            return client
+        if self.provider == "local-cli" or str(client_kwargs.get("base_url", "")).startswith("local-cli://"):
+            from agent.local_cli_client import LocalCLIClient
+
+            client = LocalCLIClient(**client_kwargs)
+            logger.info(
+                "Local CLI client created (%s, shared=%s) %s",
                 reason,
                 shared,
                 self._client_log_context(),
@@ -11169,6 +11180,8 @@ class AIAgent:
                     # attempt — switch to non-streaming for the rest of this
                     # session instead of re-failing every retry.
                     if getattr(self, "_disable_streaming", False):
+                        _use_streaming = False
+                    elif getattr(getattr(self, "client", None), "supports_streaming", True) is False:
                         _use_streaming = False
                     # CopilotACPClient communicates via subprocess stdio and
                     # returns a plain SimpleNamespace — not an iterable
