@@ -181,6 +181,40 @@ class TestResolveChannelPrompts:
         assert adapter._resolve_channel_prompt("100") is None
 
 
+class TestResolveChannelWebhooks:
+    def test_match_by_channel_id(self):
+        adapter = _make_adapter()
+        adapter.config.extra = {
+            "channel_webhooks": {
+                "100": {"url": "https://discord.com/api/webhooks/abc/def", "username": "세나"}
+            }
+        }
+
+        assert adapter._resolve_channel_webhook("100") == {
+            "url": "https://discord.com/api/webhooks/abc/def",
+            "username": "세나",
+        }
+
+    def test_match_by_parent_id_for_threads(self):
+        adapter = _make_adapter()
+        adapter.config.extra = {"channel_webhooks": {"200": "https://discord.com/api/webhooks/abc/def"}}
+
+        assert adapter._resolve_channel_webhook("999", parent_id="200") == {
+            "url": "https://discord.com/api/webhooks/abc/def"
+        }
+
+    def test_exact_channel_overrides_parent_webhook(self):
+        adapter = _make_adapter()
+        adapter.config.extra = {
+            "channel_webhooks": {
+                "999": {"url": "https://discord.com/api/webhooks/thread/token"},
+                "200": {"url": "https://discord.com/api/webhooks/parent/token"},
+            }
+        }
+
+        assert adapter._resolve_channel_webhook("999", parent_id="200")["url"].endswith("/thread/token")
+
+
 @pytest.mark.asyncio
 async def test_retry_preserves_channel_prompt(monkeypatch):
     runner = _make_runner()

@@ -1108,6 +1108,25 @@ class DiscordAdapter(BasePlatformAdapter):
             if self._is_forum_parent(channel):
                 return await self._send_to_forum(channel, content)
 
+            parent_id = getattr(channel, "parent_id", None)
+            webhook_cfg = self._resolve_channel_webhook(
+                str(getattr(channel, "id", thread_id or chat_id)),
+                str(parent_id) if parent_id is not None else None,
+            )
+            if webhook_cfg:
+                webhook_result = await self._send_via_channel_webhook(
+                    webhook_cfg,
+                    content,
+                    thread_id=str(thread_id) if thread_id else None,
+                )
+                if webhook_result.success:
+                    return webhook_result
+                logger.warning(
+                    "[%s] Discord channel webhook send failed; falling back to bot send: %s",
+                    self.name,
+                    webhook_result.error,
+                )
+
             # Format and split message if needed
             formatted = self.format_message(content)
             chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
@@ -2697,6 +2716,83 @@ class DiscordAdapter(BasePlatformAdapter):
         """Resolve a Discord per-channel prompt, preferring the exact channel over its parent."""
         from gateway.platforms.base import resolve_channel_prompt
         return resolve_channel_prompt(self.config.extra, channel_id, parent_id)
+
+    def _resolve_channel_webhook(self, channel_id: str, parent_id: str | None = None) -> dict[str, Any] | None:
+        """Resolve Discord webhook persona config for a channel/thread."""
+        webhooks = self.config.extra.get("channel_webhooks") or {}
+        if not isinstance(webhooks, dict):
+            return None
+        for candidate in (str(channel_id), str(parent_id) if parent_id is not None else None):
+            if not candidate:
+                continue
+            value = webhooks.get(candidate)
+            if isinstance(value, str) and value.strip():
+                return {"url": value.strip()}
+            if isinstance(value, dict) and str(value.get("url") or "").strip():
+                return dict(value)
+        return None
+
+    async def _send_via_channel_webhook(
+        self,
+        webhook_cfg: dict[str, Any],
+        content: str,
+        *,
+        thread_id: str | None = None,
+    ) -> SendResult:
+        """Send Discord output through a channel persona webhook.
+
+        Discord webhooks allow per-channel display names and avatars while the
+        single bot account still owns inbound events, sessions, tools and cron.
+        """
+        url = str(webhook_cfg.get("url") or "").strip()
+        if not url:
+            return SendResult(success=False, error="Missing webhook URL")
+
+        try:
+            import aiohttp
+            from gateway.platforms.base import resolve_proxy_url, proxy_kwargs_for_aiohttp
+
+            formatted = self.format_message(content)
+            chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
+            _proxy = resolve_proxy_url(platform_env_var="DISCORD_PROXY")
+            _sess_kw, _req_kw = proxy_kwargs_for_aiohttp(_proxy)
+            message_ids: list[str] = []
+
+            async with aiohttp.ClientSession(**_sess_kw) as session:
+                for chunk in chunks:
+                    payload: Dict[str, Any] = {"content": chunk}
+                    if webhook_cfg.get("username"):
+                        payload["username"] = str(webhook_cfg["username"])
+                    if webhook_cfg.get("avatar_url"):
+                        payload["avatar_url"] = str(webhook_cfg["avatar_url"])
+                    params = {"wait": "true"}
+                    if thread_id:
+                        params["thread_id"] = str(thread_id)
+                    async with session.post(
+                        url,
+                        json=payload,
+                        params=params,
+                        timeout=aiohttp.ClientTimeout(total=30),
+                        **_req_kw,
+                    ) as resp:
+                        if resp.status < 200 or resp.status >= 300:
+                            body = await resp.text()
+                            return SendResult(success=False, error=f"Webhook HTTP {resp.status}: {body[:200]}")
+                        try:
+                            data = await resp.json()
+                        except Exception:
+                            data = {}
+                        if isinstance(data, dict) and data.get("id"):
+                            message_ids.append(str(data["id"]))
+
+            return SendResult(
+                success=True,
+                message_id=message_ids[0] if message_ids else None,
+                raw_response={"message_ids": message_ids, "sent_via": "channel_webhook"},
+            )
+        except Exception as e:  # pragma: no cover - defensive fallback
+            logger.error("[%s] Failed to send via Discord channel webhook: %s", self.name, e, exc_info=True)
+            return SendResult(success=False, error=str(e))
 
     def _discord_require_mention(self) -> bool:
         """Return whether Discord channel messages require a bot mention."""

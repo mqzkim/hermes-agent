@@ -45,6 +45,91 @@ def _normalize_unauthorized_dm_behavior(value: Any, default: str = "pair") -> st
     return default
 
 
+def _normalize_mapping_keys(mapping: Any) -> Any:
+    """Return *mapping* with top-level keys coerced to strings when possible."""
+    if isinstance(mapping, dict):
+        return {str(k): v for k, v in mapping.items()}
+    return mapping
+
+
+def _compile_discord_personas(platform_cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Compile high-level ``discord.personas`` into bridgeable low-level maps.
+
+    The user-facing persona config is convenient for Discord channel-specific
+    egos, but the gateway runtime consumes ``channel_prompts``,
+    ``channel_webhooks`` and ``channel_skill_bindings``.  Explicit low-level
+    maps override generated persona values; empty explicit maps do not suppress
+    generation.
+    """
+    personas = platform_cfg.get("personas") or {}
+    if not isinstance(personas, dict):
+        return {}
+
+    prompts: Dict[str, Any] = {}
+    webhooks: Dict[str, Any] = {}
+    skill_bindings: Dict[str, Any] = {}
+
+    for persona in personas.values():
+        if not isinstance(persona, dict):
+            continue
+        channels = persona.get("channels") or []
+        if isinstance(channels, (str, int)):
+            channels = [channels]
+        if not isinstance(channels, list):
+            continue
+
+        prompt = persona.get("prompt") or persona.get("system_prompt")
+        skills = persona.get("skills") or persona.get("skill_bindings")
+
+        webhook = persona.get("webhook")
+        if not isinstance(webhook, dict):
+            webhook = {}
+        webhook_url = persona.get("webhook_url") or webhook.get("url")
+        if webhook_url:
+            webhook = dict(webhook)
+            webhook["url"] = webhook_url
+            username = (
+                persona.get("username")
+                or persona.get("display_name")
+                or webhook.get("username")
+            )
+            if username:
+                webhook["username"] = username
+            avatar_url = persona.get("avatar_url") or webhook.get("avatar_url")
+            if avatar_url:
+                webhook["avatar_url"] = avatar_url
+
+        for channel in channels:
+            channel_id = str(channel)
+            if prompt:
+                prompts[channel_id] = prompt
+            if webhook.get("url"):
+                webhooks[channel_id] = dict(webhook)
+            if skills:
+                skill_bindings[channel_id] = skills
+
+    compiled: Dict[str, Any] = {}
+    if prompts:
+        compiled["channel_prompts"] = prompts
+    if webhooks:
+        compiled["channel_webhooks"] = webhooks
+    if skill_bindings:
+        compiled["channel_skill_bindings"] = skill_bindings
+
+    for key in ("channel_prompts", "channel_webhooks", "channel_skill_bindings"):
+        explicit = platform_cfg.get(key)
+        if isinstance(explicit, dict) and explicit:
+            generated = compiled.get(key, {})
+            if isinstance(generated, dict):
+                merged = dict(generated)
+                merged.update(_normalize_mapping_keys(explicit))
+                compiled[key] = merged
+            else:
+                compiled[key] = _normalize_mapping_keys(explicit)
+
+    return compiled
+
+
 class Platform(Enum):
     """Supported messaging platforms."""
     LOCAL = "local"
@@ -581,6 +666,8 @@ def load_gateway_config() -> GatewayConfig:
                     continue
                 # Collect bridgeable keys from this platform section
                 bridged = {}
+                if plat == Platform.DISCORD:
+                    bridged.update(_compile_discord_personas(platform_cfg))
                 if "unauthorized_dm_behavior" in platform_cfg:
                     bridged["unauthorized_dm_behavior"] = _normalize_unauthorized_dm_behavior(
                         platform_cfg.get("unauthorized_dm_behavior"),
@@ -605,13 +692,32 @@ def load_gateway_config() -> GatewayConfig:
                 if "group_allow_from" in platform_cfg:
                     bridged["group_allow_from"] = platform_cfg["group_allow_from"]
                 if plat in (Platform.DISCORD, Platform.SLACK) and "channel_skill_bindings" in platform_cfg:
-                    bridged["channel_skill_bindings"] = platform_cfg["channel_skill_bindings"]
+                    bindings = platform_cfg["channel_skill_bindings"]
+                    if isinstance(bindings, dict):
+                        existing = bridged.get("channel_skill_bindings", {})
+                        merged = dict(existing) if isinstance(existing, dict) else {}
+                        merged.update({str(k): v for k, v in bindings.items()})
+                        bridged["channel_skill_bindings"] = merged
+                    else:
+                        bridged["channel_skill_bindings"] = bindings
                 if "channel_prompts" in platform_cfg:
                     channel_prompts = platform_cfg["channel_prompts"]
                     if isinstance(channel_prompts, dict):
-                        bridged["channel_prompts"] = {str(k): v for k, v in channel_prompts.items()}
+                        existing = bridged.get("channel_prompts", {})
+                        merged = dict(existing) if isinstance(existing, dict) else {}
+                        merged.update({str(k): v for k, v in channel_prompts.items()})
+                        bridged["channel_prompts"] = merged
                     else:
                         bridged["channel_prompts"] = channel_prompts
+                if plat == Platform.DISCORD and "channel_webhooks" in platform_cfg:
+                    channel_webhooks = platform_cfg["channel_webhooks"]
+                    if isinstance(channel_webhooks, dict):
+                        existing = bridged.get("channel_webhooks", {})
+                        merged = dict(existing) if isinstance(existing, dict) else {}
+                        merged.update({str(k): v for k, v in channel_webhooks.items()})
+                        bridged["channel_webhooks"] = merged
+                    else:
+                        bridged["channel_webhooks"] = channel_webhooks
                 enabled_was_explicit = "enabled" in platform_cfg
                 if not bridged and not enabled_was_explicit:
                     continue
