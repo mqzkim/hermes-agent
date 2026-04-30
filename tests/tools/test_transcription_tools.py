@@ -204,6 +204,54 @@ class TestExplicitProviderRespected:
 
 
 # ============================================================================
+# STT language guard
+# ============================================================================
+
+class TestLanguageGuard:
+    def test_language_guard_wraps_out_of_policy_script_transcripts(self):
+        from tools.transcription_tools import _apply_stt_language_guard
+
+        result = {
+            "success": True,
+            "transcript": "那你們現在可以找到香港的東西案嗎?",
+            "provider": "local",
+        }
+        guarded = _apply_stt_language_guard(
+            result,
+            {"allowed_languages": ["ko", "en"]},
+        )
+
+        assert guarded["success"] is True
+        assert guarded["transcript"] != result["transcript"]
+        assert "likely STT error" in guarded["transcript"]
+        assert "Korean or English" in guarded["transcript"]
+        assert "那你們現在可以找到香港的東西案嗎?" in guarded["transcript"]
+        assert guarded["language_guard"] == "wrapped"
+        assert guarded["raw_transcript"] == "那你們現在可以找到香港的東西案嗎?"
+
+    def test_language_guard_allows_korean_and_english(self):
+        from tools.transcription_tools import _apply_stt_language_guard
+
+        for transcript in ("내가 뭐라고 했지?", "What did I say?"):
+            result = {"success": True, "transcript": transcript, "provider": "local"}
+            guarded = _apply_stt_language_guard(
+                result,
+                {"allowed_languages": "ko,en"},
+            )
+            assert guarded == result
+
+    def test_language_guard_disabled_when_no_allowed_languages_configured(self):
+        from tools.transcription_tools import _apply_stt_language_guard
+
+        result = {
+            "success": True,
+            "transcript": "आिनामने व़ि़ियोने ग्योने सरे",
+            "provider": "local",
+        }
+        assert _apply_stt_language_guard(result, {}) == result
+
+
+# ============================================================================
 # _transcribe_groq
 # ============================================================================
 
@@ -826,6 +874,20 @@ class TestTranscribeAudioDispatch:
 
         assert result["success"] is True
         mock_openai.assert_called_once()
+
+    def test_language_guard_applied_to_dispatched_provider_result(self, sample_ogg):
+        config = {"provider": "local", "allowed_languages": ["ko", "en"]}
+        with patch("tools.transcription_tools._load_stt_config", return_value=config), \
+             patch("tools.transcription_tools._get_provider", return_value="local"), \
+             patch("tools.transcription_tools._transcribe_local",
+                   return_value={"success": True, "transcript": "आिनामने व़ि़ियोने ग्योने सरे"}):
+            from tools.transcription_tools import transcribe_audio
+            result = transcribe_audio(sample_ogg)
+
+        assert result["success"] is True
+        assert result["language_guard"] == "wrapped"
+        assert result["raw_transcript"] == "आिनामने व़ि़ियोने ग्योने सरे"
+        assert "likely STT error" in result["transcript"]
 
     def test_no_provider_returns_error(self, sample_ogg):
         with patch("tools.transcription_tools._load_stt_config", return_value={}), \
