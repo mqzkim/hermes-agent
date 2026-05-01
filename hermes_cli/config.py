@@ -448,6 +448,11 @@ DEFAULT_CONFIG = {
         # default is 1800s) plus runtime slack.  Set to 0 to disable the
         # gate and restore pre-fix behaviour (always inject).
         "gateway_auto_continue_freshness": 3600,
+        # When true, gateway startup automatically dispatches fresh
+        # resume_pending sessions that were interrupted by the previous
+        # restart/shutdown drain timeout.  This lets Discord threads resume
+        # without requiring a manual "continue" message in every thread.
+        "gateway_auto_resume_pending": True,
         # How user-attached images are presented to the main model on each turn.
         #   "auto"   — attach natively when the active model reports
         #              supports_vision=True AND the user hasn't explicitly
