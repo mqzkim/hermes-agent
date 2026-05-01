@@ -2,6 +2,10 @@
 
 Instructions for AI coding assistants and developers working on the hermes-agent codebase.
 
+## Design Context
+
+For any UI, visual artifact, dashboard, report, deck, browser preview, or design-skill work, read root `DESIGN.md` first. `DESIGN.md` is the design source of truth and compact inline index for Hermes Agent visual identity, Open Design references, and design-skill priorities. Use this `AGENTS.md` for engineering/process guidance; use `DESIGN.md` for look, feel, layout, components, artifact surfaces, and design-system references.
+
 ## Development Environment
 
 ```bash

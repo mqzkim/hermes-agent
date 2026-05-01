@@ -507,6 +507,37 @@ class TestBuildContextFilesPrompt:
         assert "Ruff for linting" in result
         assert "Project Context" in result
 
+    def test_loads_design_md_alongside_agents_md(self, tmp_path):
+        (tmp_path / "AGENTS.md").write_text("Use Ruff for linting.")
+        (tmp_path / "DESIGN.md").write_text("# Design\n\nUse teal accents.")
+        result = build_context_files_prompt(cwd=str(tmp_path))
+        assert "Ruff for linting" in result
+        assert "Use teal accents" in result
+        assert "AGENTS.md" in result
+        assert "DESIGN.md" in result
+
+    def test_design_md_parent_dir_discovery(self, tmp_path):
+        (tmp_path / ".git").mkdir()
+        (tmp_path / "DESIGN.md").write_text("# Design\n\nRoot visual identity.")
+        sub = tmp_path / "src" / "components"
+        sub.mkdir(parents=True)
+        result = build_context_files_prompt(cwd=str(sub))
+        assert "Root visual identity" in result
+
+    def test_design_md_stops_at_git_root(self, tmp_path):
+        (tmp_path / "DESIGN.md").write_text("Parent design identity.")
+        child = tmp_path / "repo"
+        child.mkdir()
+        (child / ".git").mkdir()
+        result = build_context_files_prompt(cwd=str(child))
+        assert "Parent design identity" not in result
+
+    def test_design_md_lowercase(self, tmp_path):
+        (tmp_path / "design.md").write_text("# Design\n\nLowercase design identity.")
+        result = build_context_files_prompt(cwd=str(tmp_path))
+        assert "Lowercase design identity" in result
+        assert "design.md" in result
+
     def test_loads_cursorrules(self, tmp_path):
         (tmp_path / ".cursorrules").write_text("Always use type hints.")
         result = build_context_files_prompt(cwd=str(tmp_path))
