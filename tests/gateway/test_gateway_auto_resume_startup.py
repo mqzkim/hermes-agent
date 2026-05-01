@@ -15,14 +15,17 @@ from gateway.session import SessionEntry, SessionSource
 
 
 class FakeAdapter:
-    def __init__(self):
+    def __init__(self, *, fail_send: bool = False):
         self.events: list[MessageEvent] = []
         self.sent: list[tuple[str, str, object]] = []
+        self.fail_send = fail_send
 
     async def handle_message(self, event: MessageEvent) -> None:
         self.events.append(event)
 
     async def send(self, chat_id: str, content: str, **kwargs) -> None:
+        if self.fail_send:
+            raise RuntimeError("send unavailable")
         self.sent.append((chat_id, content, kwargs.get("metadata")))
 
 
@@ -127,6 +130,20 @@ async def test_auto_resume_startup_dispatches_internal_synthetic_events_to_origi
         {"thread_id": "thread-a"},
         {"thread_id": "thread-b"},
     ]
+
+
+@pytest.mark.asyncio
+async def test_auto_resume_startup_resumes_even_when_notification_send_fails(monkeypatch):
+    monkeypatch.setenv("HERMES_GATEWAY_AUTO_RESUME_PENDING", "true")
+    adapter = FakeAdapter(fail_send=True)
+    runner = _runner({"fresh": _entry("fresh")}, adapter=adapter)
+
+    count = await runner._auto_resume_pending_sessions()
+
+    assert count == 1
+    assert len(adapter.events) == 1
+    assert adapter.events[0].internal is True
+    assert adapter.sent == []
 
 
 @pytest.mark.asyncio
