@@ -2377,11 +2377,18 @@ class GatewayRunner:
             metadata = {"thread_id": source.thread_id} if getattr(source, "thread_id", None) else None
             try:
                 if hasattr(adapter, "send"):
-                    await adapter.send(
-                        source.chat_id,
-                        "↻ Gateway restarted — auto-resuming the interrupted task in this thread.",
-                        metadata=metadata,
-                    )
+                    try:
+                        await adapter.send(
+                            source.chat_id,
+                            "↻ Gateway restarted — auto-resuming the interrupted task in this thread.",
+                            metadata=metadata,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "Auto-resume notification failed for session %s: %s",
+                            session_key,
+                            exc,
+                        )
                 event = self._build_auto_resume_event(entry)
                 await adapter.handle_message(event)
                 count += 1
