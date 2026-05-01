@@ -362,6 +362,13 @@ if _config_path.exists():
                 os.environ["HERMES_AUTO_CONTINUE_FRESHNESS"] = str(
                     _agent_cfg["gateway_auto_continue_freshness"]
                 )
+            if (
+                "gateway_auto_resume_pending" in _agent_cfg
+                and "HERMES_GATEWAY_AUTO_RESUME_PENDING" not in os.environ
+            ):
+                os.environ["HERMES_GATEWAY_AUTO_RESUME_PENDING"] = str(
+                    _agent_cfg["gateway_auto_resume_pending"]
+                )
         _display_cfg = _cfg.get("display", {})
         if _display_cfg and isinstance(_display_cfg, dict):
             if "busy_input_mode" in _display_cfg and "HERMES_GATEWAY_BUSY_INPUT_MODE" not in os.environ:
@@ -2270,6 +2277,119 @@ class GatewayRunner:
         except Exception:
             pass
 
+    @staticmethod
+    def _auto_resume_pending_enabled() -> bool:
+        """Return whether gateway startup should auto-dispatch resumable turns."""
+        raw = os.getenv("HERMES_GATEWAY_AUTO_RESUME_PENDING", "").strip()
+        if raw:
+            return is_truthy_value(raw, default=True)
+        try:
+            cfg = _load_gateway_config()
+            return is_truthy_value(
+                cfg_get(cfg, "agent", "gateway_auto_resume_pending", default=True),
+                default=True,
+            )
+        except Exception:
+            return True
+
+    def _collect_auto_resume_entries(self) -> list[tuple[str, Any]]:
+        """Return fresh, connected ``resume_pending`` sessions to restart.
+
+        The gateway already marks sessions as ``resume_pending`` when a
+        restart/shutdown drain times out.  Previously the next user message in
+        each thread had to trigger recovery manually.  This selector finds the
+        safe subset that can be resumed automatically after startup: pending,
+        not suspended, still fresh, with an origin and a connected adapter, and
+        not already running in this process.
+        """
+        store = getattr(self, "session_store", None)
+        if store is None:
+            return []
+        try:
+            store._ensure_loaded()
+        except Exception:
+            logger.debug("auto-resume: failed to load session store", exc_info=True)
+            return []
+
+        freshness_window = _auto_continue_freshness_window()
+        running = getattr(self, "_running_agents", {}) or {}
+        adapters = getattr(self, "adapters", {}) or {}
+        entries = []
+        for session_key, entry in list(getattr(store, "_entries", {}).items()):
+            if not getattr(entry, "resume_pending", False):
+                continue
+            if getattr(entry, "suspended", False):
+                continue
+            if session_key in running:
+                continue
+            source = getattr(entry, "origin", None)
+            if source is None:
+                continue
+            if source.platform not in adapters:
+                continue
+            freshness_ts = (
+                getattr(entry, "last_resume_marked_at", None)
+                or getattr(entry, "updated_at", None)
+            )
+            if not _is_fresh_gateway_interruption(
+                freshness_ts,
+                window_secs=freshness_window,
+            ):
+                continue
+            entries.append((session_key, entry))
+        return entries
+
+    @staticmethod
+    def _build_auto_resume_event(entry: Any) -> MessageEvent:
+        source = getattr(entry, "origin", None)
+        return MessageEvent(
+            text=(
+                "Continue the interrupted task from before the gateway restart. "
+                "Use the existing conversation history, process any unfinished "
+                "tool result(s) first, and then summarize the recovered state "
+                "and next action."
+            ),
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id=None,
+            internal=True,
+        )
+
+    async def _auto_resume_pending_sessions(self) -> int:
+        """Dispatch fresh ``resume_pending`` sessions after gateway startup.
+
+        Returns the number of sessions queued for resumed processing.  Each
+        resumed turn goes through the platform adapter's normal background
+        processing path, so per-thread delivery, media extraction, typing
+        indicators, and session guards behave like a user-triggered message.
+        """
+        if not self._auto_resume_pending_enabled():
+            return 0
+        if getattr(self, "_draining", False):
+            return 0
+
+        count = 0
+        for session_key, entry in self._collect_auto_resume_entries():
+            source = getattr(entry, "origin", None)
+            adapter = (getattr(self, "adapters", {}) or {}).get(source.platform) if source else None
+            if adapter is None or not hasattr(adapter, "handle_message"):
+                continue
+            metadata = {"thread_id": source.thread_id} if getattr(source, "thread_id", None) else None
+            try:
+                if hasattr(adapter, "send"):
+                    await adapter.send(
+                        source.chat_id,
+                        "↻ Gateway restarted — auto-resuming the interrupted task in this thread.",
+                        metadata=metadata,
+                    )
+                event = self._build_auto_resume_event(entry)
+                await adapter.handle_message(event)
+                count += 1
+                logger.info("Auto-resumed pending session %s", session_key)
+            except Exception as exc:
+                logger.warning("Auto-resume failed for session %s: %s", session_key, exc)
+        return count
+
     async def _launch_detached_restart_command(self) -> None:
         import shutil
         import subprocess
@@ -2635,6 +2755,13 @@ class GatewayRunner:
 
         # Notify the chat that initiated /restart that the gateway is back.
         await self._send_restart_notification()
+
+        try:
+            resumed = await self._auto_resume_pending_sessions()
+            if resumed:
+                logger.info("Auto-resume queued %d pending gateway session(s)", resumed)
+        except Exception as e:
+            logger.warning("Auto-resume pending sessions failed: %s", e)
 
         # Drain any recovered process watchers (from crash recovery checkpoint)
         try:

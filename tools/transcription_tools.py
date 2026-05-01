@@ -38,7 +38,7 @@ from urllib.parse import urljoin
 
 from utils import is_truthy_value
 from tools.managed_tool_gateway import resolve_managed_tool_gateway
-from tools.stt_language_guard import apply_stt_language_guard as _apply_stt_language_guard
+from tools.stt_language_guard import apply_stt_language_guard as _apply_stt_language_guard_impl
 from tools.tool_backend_helpers import managed_nous_tools_enabled, resolve_openai_audio_api_key
 
 logger = logging.getLogger(__name__)
@@ -778,147 +778,11 @@ def _transcribe_xai(file_path: str, model_name: str) -> Dict[str, Any]:
 # STT language guard
 # ---------------------------------------------------------------------------
 
-_LANGUAGE_LABELS = {
-    "en": "English",
-    "ko": "Korean",
-    "zh": "Chinese",
-    "ja": "Japanese",
-    "hi": "Hindi",
-}
-
-_LANGUAGE_SCRIPT_MARKERS = {
-    "en": ("LATIN",),
-    "ko": ("HANGUL",),
-    "zh": ("CJK", "BOPOMOFO"),
-    "ja": ("HIRAGANA", "KATAKANA", "CJK"),
-    "hi": ("DEVANAGARI",),
-}
-
-
-def _normalize_allowed_languages(value: Any) -> list[str]:
-    """Normalize ``stt.allowed_languages`` into ISO-ish lowercase codes."""
-    if not value:
-        return []
-    if isinstance(value, str):
-        raw_items = value.replace(";", ",").replace(" ", ",").split(",")
-    elif isinstance(value, (list, tuple, set)):
-        raw_items = value
-    else:
-        return []
-
-    aliases = {
-        "english": "en",
-        "eng": "en",
-        "korean": "ko",
-        "kor": "ko",
-        "hangul": "ko",
-        "한글": "ko",
-        "한국어": "ko",
-    }
-    normalized: list[str] = []
-    for item in raw_items:
-        code = str(item).strip().lower().replace("_", "-")
-        if not code:
-            continue
-        code = aliases.get(code, code.split("-")[0])
-        if code not in normalized:
-            normalized.append(code)
-    return normalized
-
-
-def _language_label(allowed_languages: list[str]) -> str:
-    labels = [_LANGUAGE_LABELS.get(code, code) for code in allowed_languages]
-    if not labels:
-        return "configured languages"
-    if len(labels) == 1:
-        return labels[0]
-    return ", ".join(labels[:-1]) + " or " + labels[-1]
-
-
-def _char_script_name(ch: str) -> str:
-    try:
-        return unicodedata.name(ch)
-    except ValueError:
-        return ""
-
-
-def _is_neutral_transcript_char(ch: str) -> bool:
-    if ch.isascii() and not ch.isalpha():
-        return True
-    category = unicodedata.category(ch)
-    return category[0] in {"N", "P", "S", "Z", "C"}
-
-
-def _char_allowed_by_languages(ch: str, allowed_languages: list[str]) -> bool:
-    if _is_neutral_transcript_char(ch):
-        return True
-    name = _char_script_name(ch)
-    for lang in allowed_languages:
-        markers = _LANGUAGE_SCRIPT_MARKERS.get(lang)
-        if markers and any(marker in name for marker in markers):
-            return True
-    return False
-
-
-def _transcript_violates_language_guard(transcript: str, allowed_languages: list[str]) -> bool:
-    """Return True when a transcript is mostly outside configured scripts.
-
-    This is intentionally conservative: mixed Korean/English text with a few
-    symbols or loanwords should pass, while full-script hallucinations like
-    Devanagari or Chinese for a ko/en-only user are wrapped for the agent.
-    """
-    signal = 0
-    allowed = 0
-    disallowed = 0
-    for ch in transcript:
-        if _is_neutral_transcript_char(ch):
-            continue
-        signal += 1
-        if _char_allowed_by_languages(ch, allowed_languages):
-            allowed += 1
-        else:
-            disallowed += 1
-
-    if signal < 3:
-        return False
-    allowed_ratio = allowed / signal
-    disallowed_ratio = disallowed / signal
-    return disallowed_ratio >= 0.60 and allowed_ratio <= 0.30
-
 
 def _apply_stt_language_guard(result: Dict[str, Any], stt_config: Optional[dict] = None) -> Dict[str, Any]:
-    """Wrap out-of-policy STT output so the agent does not trust wrong scripts.
-
-    Configure with ``stt.allowed_languages`` (for example ``["ko", "en"]``).
-    Providers may still hallucinate another script; instead of translating that
-    script as real user intent, we keep the raw transcript and add an explicit
-    instruction that this is likely a transcription error.
-    """
-    if not result.get("success"):
-        return result
-    transcript = str(result.get("transcript") or "").strip()
-    if not transcript:
-        return result
-
+    """Compatibility wrapper around the shared STT language guard."""
     cfg = stt_config if stt_config is not None else _load_stt_config()
-    allowed_languages = _normalize_allowed_languages(cfg.get("allowed_languages"))
-    if not allowed_languages:
-        return result
-    if not _transcript_violates_language_guard(transcript, allowed_languages):
-        return result
-
-    label = _language_label(allowed_languages)
-    guarded = dict(result)
-    guarded["raw_transcript"] = transcript
-    guarded["language_guard"] = "wrapped"
-    guarded["transcript"] = (
-        "[STT language guard: This transcript is outside the configured "
-        f"voice languages ({label}) and is likely STT error. Do not interpret "
-        "or translate it as a real foreign-language utterance. Treat the user "
-        f"as speaking {label}; infer from context when safe, otherwise ask for "
-        f"clarification. Raw transcript: {transcript}]"
-    )
-    return guarded
+    return _apply_stt_language_guard_impl(result, cfg)
 
 
 # ---------------------------------------------------------------------------
