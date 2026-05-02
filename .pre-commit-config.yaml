@@ -13,3 +13,9 @@ repos:
         language: system
         pass_filenames: false
         files: ^(run_agent\.py|cron/scheduler\.py|gateway/run\.py|tests/agent/test_memory_prompt_suppression\.py|tests/gateway/test_agent_cache_memory_config\.py|tests/cron/test_scheduler\.py|scripts/pre_commit_memory_gate\.py|\.pre-commit-config\.yaml)$
+      - id: run-graph-core-gate
+        name: RunGraph core unit/regression gate
+        entry: python -m pytest tests/agent/test_run_events.py tests/agent/test_run_graph.py tests/agent/test_run_event_store.py tests/agent/test_run_projection.py -q -o addopts=
+        language: system
+        pass_filenames: false
+        files: ^(agent/run_events\.py|agent/run_graph\.py|agent/run_event_store\.py|agent/run_projection\.py|tests/agent/test_run_events\.py|tests/agent/test_run_graph\.py|tests/agent/test_run_event_store\.py|tests/agent/test_run_projection\.py|\.pre-commit-config\.yaml)$
