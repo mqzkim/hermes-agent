@@ -216,6 +216,41 @@ describe('createSlashHandler', () => {
     })
   })
 
+  it('renders a RunGraph control contract panel for /runs <run_id> controls', async () => {
+    const rpc = vi.fn(() =>
+      Promise.resolve({
+        actions: {
+          retry_failed_nodes: {
+            eligible_node_count: 1,
+            enabled: false,
+            reason: 'rungraph_controls_read_only_contract'
+          }
+        },
+        failed_node_count: 1,
+        failed_node_ids: ['node_1'],
+        read_only: true,
+        reason: 'rungraph_controls_read_only_contract',
+        run_id: 'run_full_1',
+        run_status: 'failed'
+      })
+    )
+
+    const ctx = buildCtx({ gateway: { ...buildGateway(), rpc } })
+
+    expect(createSlashHandler(ctx)('/runs run_full_1 controls')).toBe(true)
+
+    await vi.waitFor(() => {
+      expect(rpc).toHaveBeenCalledWith('runs.controls', { run_id: 'run_full_1' })
+      expect(ctx.transcript.panel).toHaveBeenCalledWith(
+        'RunGraph controls · run_full_1',
+        expect.arrayContaining([
+          expect.objectContaining({ title: 'Operator control contract' }),
+          expect.objectContaining({ title: 'Actions' })
+        ])
+      )
+    })
+  })
+
   it('routes /details through config.set', () => {
     const ctx = buildCtx()
 

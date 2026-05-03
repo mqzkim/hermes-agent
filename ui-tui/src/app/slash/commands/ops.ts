@@ -7,6 +7,7 @@ import type {
   RollbackDiffResponse,
   RollbackListResponse,
   RollbackRestoreResponse,
+  RunGraphControlsResponse,
   RunGraphEventsResponse,
   RunGraphListResponse,
   RunGraphRun,
@@ -179,12 +180,38 @@ const panelForRunEvents = (runId: string, events: RunGraphEventsResponse['events
   ]
 }
 
+const panelForRunControls = (controls: RunGraphControlsResponse): PanelSection[] => {
+  const actions = Object.entries(controls.actions ?? {})
+
+  return [
+    {
+      rows: [
+        ['Run', controls.run_id || '—'],
+        ['Status', controls.run_status || 'unknown'],
+        ['Read-only', controls.read_only ? 'yes' : 'no'],
+        ['Failed nodes', String(controls.failed_node_count ?? controls.failed_node_ids?.length ?? 0)],
+        ['Reason', controls.reason || '—']
+      ],
+      title: 'Operator control contract'
+    },
+    {
+      rows: actions.map(([name, action]) => [
+        name,
+        `${action.enabled ? 'enabled' : 'disabled'} · ${action.reason || '—'}${
+          action.eligible_node_count !== undefined ? ` · eligible ${action.eligible_node_count}` : ''
+        }`
+      ]),
+      title: 'Actions'
+    }
+  ]
+}
+
 export const opsCommands: SlashCommand[] = [
   {
     aliases: ['rungraph', 'run-graph'],
     help: 'show persisted RunGraph runs or a run snapshot',
     name: 'runs',
-    usage: '/runs [run_id] [events]',
+    usage: '/runs [run_id] [events|controls]',
     run: (arg, ctx) => {
       const parts = arg.trim().split(/\s+/).filter(Boolean)
       const [runId, mode] = parts
@@ -204,6 +231,19 @@ export const opsCommands: SlashCommand[] = [
           .then(
             ctx.guarded<RunGraphEventsResponse>(r =>
               ctx.transcript.panel(`RunGraph events · ${shortId(runId)}`, panelForRunEvents(runId, r.events ?? []))
+            )
+          )
+          .catch(ctx.guardedErr)
+
+        return
+      }
+
+      if ((mode || '').toLowerCase() === 'controls') {
+        ctx.gateway
+          .rpc<RunGraphControlsResponse>('runs.controls', { run_id: runId })
+          .then(
+            ctx.guarded<RunGraphControlsResponse>(r =>
+              ctx.transcript.panel(`RunGraph controls · ${shortId(runId)}`, panelForRunControls(r))
             )
           )
           .catch(ctx.guardedErr)
