@@ -1304,6 +1304,23 @@ class DiscordAdapter(BasePlatformAdapter):
             raw_response={"thread_id": thread_id},
         )
 
+    @staticmethod
+    def _should_fallback_edit_failure(exc: Exception) -> bool:
+        """Return True when Discord rejected an edit because the target is unusable.
+
+        50005 means the target message exists but was authored by someone else;
+        10008 means the target message no longer exists.  In both cases a
+        follow-up send is safer than dropping the visible final/progress update.
+        Other permission errors such as 50013 must remain hard failures.
+        """
+        err_text = str(exc)
+        return (
+            "error code: 50005" in err_text
+            or "Cannot edit a message authored by another user" in err_text
+            or "error code: 10008" in err_text
+            or "Unknown Message" in err_text
+        )
+
     async def edit_message(
         self,
         chat_id: str,
@@ -1312,7 +1329,12 @@ class DiscordAdapter(BasePlatformAdapter):
         *,
         finalize: bool = False,
     ) -> SendResult:
-        """Edit a previously sent Discord message."""
+        """Edit a previously sent Discord message.
+
+        If Discord rejects the edit because the target is missing or not owned
+        by this bot, send a new message in the same chat so final output stays
+        visible to the user.
+        """
         if not self._client:
             return SendResult(success=False, error="Not connected")
         try:
@@ -1326,6 +1348,24 @@ class DiscordAdapter(BasePlatformAdapter):
             await msg.edit(content=formatted)
             return SendResult(success=True, message_id=message_id)
         except Exception as e:  # pragma: no cover - defensive logging
+            if self._should_fallback_edit_failure(e):
+                logger.warning(
+                    "[%s] Discord edit target %s is not editable; sending a new message instead: %s",
+                    self.name,
+                    message_id,
+                    e,
+                )
+                fallback = await self.send(chat_id, content)
+                if fallback.success:
+                    raw = dict(fallback.raw_response or {})
+                    raw["fallback_from_edit_message_id"] = str(message_id)
+                    fallback.raw_response = raw
+                    return fallback
+                return SendResult(
+                    success=False,
+                    error=f"Edit failed ({e}); fallback send failed ({fallback.error})",
+                    raw_response={"fallback_from_edit_message_id": str(message_id)},
+                )
             logger.error("[%s] Failed to edit Discord message %s: %s", self.name, message_id, e, exc_info=True)
             return SendResult(success=False, error=str(e))
 

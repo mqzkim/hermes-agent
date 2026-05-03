@@ -159,6 +159,89 @@ async def test_send_does_not_retry_on_unrelated_errors():
     assert send_calls[0]["reference"] is reference_obj
 
 
+@pytest.mark.asyncio
+async def test_edit_message_falls_back_to_new_message_when_target_is_not_editable():
+    """Discord can only edit messages authored by this bot.
+
+    If progress/finalization points at a user-authored message, Discord returns
+    50005. The user-facing result should still become visible as a new message
+    instead of a failed silent edit.
+    """
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+
+    original_msg = SimpleNamespace(
+        edit=AsyncMock(
+            side_effect=RuntimeError(
+                "403 Forbidden (error code: 50005): Cannot edit a message authored by another user"
+            )
+        )
+    )
+    fallback_msg = SimpleNamespace(id=4321)
+    channel = SimpleNamespace(
+        fetch_message=AsyncMock(return_value=original_msg),
+        send=AsyncMock(return_value=fallback_msg),
+    )
+    adapter._client = SimpleNamespace(
+        get_channel=lambda _chat_id: channel,
+        fetch_channel=AsyncMock(),
+    )
+
+    result = await adapter.edit_message("555", "999", "final answer")
+
+    assert result.success is True
+    assert result.message_id == "4321"
+    assert result.raw_response["fallback_from_edit_message_id"] == "999"
+    original_msg.edit.assert_awaited_once()
+    channel.send.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_edit_message_falls_back_to_new_message_when_target_is_missing():
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+
+    fallback_msg = SimpleNamespace(id=4322)
+    channel = SimpleNamespace(
+        fetch_message=AsyncMock(
+            side_effect=RuntimeError("404 Not Found (error code: 10008): Unknown Message")
+        ),
+        send=AsyncMock(return_value=fallback_msg),
+    )
+    adapter._client = SimpleNamespace(
+        get_channel=lambda _chat_id: channel,
+        fetch_channel=AsyncMock(),
+    )
+
+    result = await adapter.edit_message("555", "999", "final answer")
+
+    assert result.success is True
+    assert result.message_id == "4322"
+    assert result.raw_response["fallback_from_edit_message_id"] == "999"
+    channel.send.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_edit_message_does_not_fallback_on_unrelated_discord_errors():
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+
+    original_msg = SimpleNamespace(
+        edit=AsyncMock(side_effect=RuntimeError("403 Forbidden (error code: 50013): Missing Permissions"))
+    )
+    channel = SimpleNamespace(
+        fetch_message=AsyncMock(return_value=original_msg),
+        send=AsyncMock(),
+    )
+    adapter._client = SimpleNamespace(
+        get_channel=lambda _chat_id: channel,
+        fetch_channel=AsyncMock(),
+    )
+
+    result = await adapter.edit_message("555", "999", "final answer")
+
+    assert result.success is False
+    assert "50013" in (result.error or "")
+    channel.send.assert_not_awaited()
+
+
 # ---------------------------------------------------------------------------
 # Forum channel tests
 # ---------------------------------------------------------------------------
