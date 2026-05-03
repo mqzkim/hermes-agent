@@ -606,30 +606,73 @@ class SessionDB:
     def _event_payload(record: RunEventRecord) -> Dict[str, Any]:
         return record.to_dict()
 
+    def _table_columns(self, table: str) -> set[str]:
+        return {str(row[1]) for row in self._conn.execute(f"PRAGMA table_info({table})").fetchall()}
+
+    def _ensure_run_session_row(self, record: RunRecord) -> None:
+        if not record.session_id:
+            return
+        try:
+            self.ensure_session(record.session_id, source=record.source or "run_graph", model=record.model)
+        except Exception:
+            # Best-effort: if session creation still fails, let save_run_record's
+            # normal persistence path surface through PersistenceLayer isolation.
+            pass
+
     def save_run_record(self, record: RunRecord) -> None:
         payload = self._run_payload(record)
+        self._ensure_run_session_row(record)
 
         def _do(conn):
-            conn.execute(
-                """
-                INSERT OR REPLACE INTO runs
-                    (run_id, payload, started_at, session_id, source, status)
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    record.run_id,
-                    self._json_dumps(payload),
-                    record.started_at,
-                    record.session_id,
-                    record.source,
-                    record.status.value,
-                ),
-            )
+            cols = self._table_columns("runs")
+            if "id" in cols:
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO runs
+                        (id, run_id, payload, started_at, session_id, source, root_goal, status, ended_at, parent_run_id, model, provider, metadata, schema_version)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        record.run_id,
+                        record.run_id,
+                        self._json_dumps(payload),
+                        record.started_at,
+                        record.session_id,
+                        record.source,
+                        record.root_goal,
+                        record.status.value,
+                        record.ended_at,
+                        record.parent_run_id,
+                        record.model,
+                        record.provider,
+                        self._json_dumps(record.metadata or {}),
+                        record.schema_version,
+                    ),
+                )
+            else:
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO runs
+                        (run_id, payload, started_at, session_id, source, status)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        record.run_id,
+                        self._json_dumps(payload),
+                        record.started_at,
+                        record.session_id,
+                        record.source,
+                        record.status.value,
+                    ),
+                )
 
         self._execute_write(_do)
 
     def get_run_record(self, run_id: str) -> RunRecord | None:
-        row = self._conn.execute("SELECT payload FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+        if "id" in self._table_columns("runs"):
+            row = self._conn.execute("SELECT payload FROM runs WHERE run_id = ? OR id = ?", (run_id, run_id)).fetchone()
+        else:
+            row = self._conn.execute("SELECT payload FROM runs WHERE run_id = ?", (run_id,)).fetchone()
         if row is None:
             return None
         return RunRecord.from_dict(self._json_loads_dict(row["payload"]))
@@ -646,58 +689,115 @@ class SessionDB:
         payload = self._node_payload(record)
 
         def _do(conn):
-            conn.execute(
-                """
-                INSERT OR REPLACE INTO run_nodes
-                    (node_id, run_id, payload, started_at, parent_node_id, node_type, status)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    record.node_id,
-                    record.run_id,
-                    self._json_dumps(payload),
-                    record.started_at,
-                    record.parent_node_id,
-                    record.node_type.value,
-                    record.status.value,
-                ),
-            )
+            cols = self._table_columns("run_nodes")
+            if "id" in cols:
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO run_nodes
+                        (id, node_id, run_id, payload, started_at, parent_node_id, node_type, title, status, ended_at, inputs, outputs, error, metadata, schema_version)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        record.node_id,
+                        record.node_id,
+                        record.run_id,
+                        self._json_dumps(payload),
+                        record.started_at,
+                        record.parent_node_id,
+                        record.node_type.value,
+                        record.title,
+                        record.status.value,
+                        record.ended_at,
+                        self._json_dumps(record.inputs or {}),
+                        self._json_dumps(record.outputs or {}),
+                        record.error,
+                        self._json_dumps(record.metadata or {}),
+                        record.schema_version,
+                    ),
+                )
+            else:
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO run_nodes
+                        (node_id, run_id, payload, started_at, parent_node_id, node_type, status)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        record.node_id,
+                        record.run_id,
+                        self._json_dumps(payload),
+                        record.started_at,
+                        record.parent_node_id,
+                        record.node_type.value,
+                        record.status.value,
+                    ),
+                )
 
         self._execute_write(_do)
 
     def get_run_node_record(self, node_id: str) -> RunNodeRecord | None:
-        row = self._conn.execute("SELECT payload FROM run_nodes WHERE node_id = ?", (node_id,)).fetchone()
+        if "id" in self._table_columns("run_nodes"):
+            row = self._conn.execute("SELECT payload FROM run_nodes WHERE node_id = ? OR id = ?", (node_id, node_id)).fetchone()
+        else:
+            row = self._conn.execute("SELECT payload FROM run_nodes WHERE node_id = ?", (node_id,)).fetchone()
         if row is None:
             return None
         return RunNodeRecord.from_dict(self._json_loads_dict(row["payload"]))
 
     def list_run_node_records(self, run_id: str) -> List[RunNodeRecord]:
-        rows = self._conn.execute(
-            "SELECT payload FROM run_nodes WHERE run_id = ? ORDER BY started_at, node_id",
-            (run_id,),
-        ).fetchall()
+        if "id" in self._table_columns("runs"):
+            rows = self._conn.execute(
+                "SELECT payload FROM run_nodes WHERE run_id = ? ORDER BY started_at, COALESCE(node_id, id)",
+                (run_id,),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT payload FROM run_nodes WHERE run_id = ? ORDER BY started_at, node_id",
+                (run_id,),
+            ).fetchall()
         return [RunNodeRecord.from_dict(self._json_loads_dict(row["payload"])) for row in rows]
 
     def append_run_event_record(self, record: RunEventRecord) -> None:
         payload = self._event_payload(record)
 
         def _do(conn):
-            conn.execute(
-                """
-                INSERT OR REPLACE INTO run_events
-                    (event_id, run_id, node_id, event_type, sequence, timestamp, payload)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    record.event_id,
-                    record.run_id,
-                    record.node_id,
-                    record.event_type.value,
-                    record.sequence,
-                    record.timestamp,
-                    self._json_dumps(payload),
-                ),
-            )
+            cols = self._table_columns("run_events")
+            if "id" in cols:
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO run_events
+                        (id, event_id, run_id, node_id, event_type, sequence, timestamp, payload, schema_version)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        record.event_id,
+                        record.event_id,
+                        record.run_id,
+                        record.node_id,
+                        record.event_type.value,
+                        record.sequence,
+                        record.timestamp,
+                        self._json_dumps(payload),
+                        record.schema_version,
+                    ),
+                )
+            else:
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO run_events
+                        (event_id, run_id, node_id, event_type, sequence, timestamp, payload)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        record.event_id,
+                        record.run_id,
+                        record.node_id,
+                        record.event_type.value,
+                        record.sequence,
+                        record.timestamp,
+                        self._json_dumps(payload),
+                    ),
+                )
 
         self._execute_write(_do)
 
