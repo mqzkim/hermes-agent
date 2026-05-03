@@ -65,6 +65,34 @@ class NonEditingProgressCaptureAdapter(ProgressCaptureAdapter):
         raise AssertionError("non-editable adapters should not receive edit_message calls")
 
 
+class FallbackProgressAdapter(ProgressCaptureAdapter):
+    """Simulate Discord adapter behavior where edit() falls back to sending a new message."""
+
+    def __init__(self, platform=Platform.TELEGRAM):
+        super().__init__(platform=platform)
+        self._edit_calls = 0
+
+    async def edit_message(self, chat_id, message_id, content) -> SendResult:
+        self.edits.append(
+            {
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "content": content,
+            }
+        )
+        self._edit_calls += 1
+        # First edit returns a different message_id (edit fallback path).
+        if self._edit_calls == 1:
+            return SendResult(success=True, message_id="fallback-msg-id")
+        return SendResult(success=True, message_id=message_id)
+
+
+class ThreadAwareFallbackProgressAdapter(FallbackProgressAdapter):
+    """Capture edit(chat_id) targets for thread-aware behavior checks."""
+
+    pass
+
+
 class FakeAgent:
     def __init__(self, **kwargs):
         # Capture anything passed via kwargs (older code path) but don't
@@ -251,6 +279,69 @@ async def test_run_agent_progress_does_not_use_event_message_id_for_telegram_dm(
     assert adapter.sent
     assert adapter.sent[0]["metadata"] is None
     assert all(call["metadata"] is None for call in adapter.typing)
+
+
+@pytest.mark.asyncio
+async def test_run_agent_progress_updates_message_id_when_edit_falls_back(monkeypatch, tmp_path):
+    """If edit_message falls back, subsequent progress updates follow the new ID."""
+
+    monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "all")
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+
+    class TripleProgressAgent:
+        def __init__(self, **kwargs):
+            self.tool_progress_callback = kwargs.get("tool_progress_callback")
+            self.tools = []
+
+        def run_conversation(self, message, conversation_history=None, task_id=None):
+            self.tool_progress_callback("tool.started", "terminal", "cmd1", {})
+            time.sleep(2.0)
+            self.tool_progress_callback("tool.started", "terminal", "cmd2", {})
+            time.sleep(2.0)
+            self.tool_progress_callback("tool.started", "terminal", "cmd3", {})
+            time.sleep(0.1)
+            return {
+                "final_response": "done",
+                "messages": [],
+                "api_calls": 3,
+            }
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = TripleProgressAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    adapter = ThreadAwareFallbackProgressAdapter(platform=Platform.DISCORD)
+    runner = _make_runner(adapter)
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
+
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="D123",
+        chat_type="group",
+        thread_id="17585",
+    )
+
+    result = await runner._run_agent(
+        message="hello",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="sess-progress-fallback-id",
+        session_key="agent:main:discord:group:D123:17585",
+    )
+
+    assert result["final_response"] == "done"
+
+    # The first edit should target the thread channel and use the fallback id.
+    edit_message_ids = [e["message_id"] for e in adapter.edits]
+    edit_chat_ids = [e["chat_id"] for e in adapter.edits]
+    assert all(cid == "17585" for cid in edit_chat_ids)
+    assert "progress-1" in edit_message_ids
+    assert "fallback-msg-id" in edit_message_ids
 
 
 @pytest.mark.asyncio

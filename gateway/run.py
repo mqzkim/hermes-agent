@@ -12276,6 +12276,7 @@ class GatewayRunner:
         else:
             _progress_thread_id = source.thread_id
         _progress_metadata = {"thread_id": _progress_thread_id} if _progress_thread_id else None
+        _progress_send_chat_id = _progress_thread_id or source.chat_id
 
         async def send_progress_messages():
             if not progress_queue:
@@ -12374,7 +12375,7 @@ class GatewayRunner:
                         # Try to edit the existing progress message
                         full_text = "\n".join(progress_lines)
                         result = await adapter.edit_message(
-                            chat_id=source.chat_id,
+                            chat_id=_progress_send_chat_id,
                             message_id=progress_msg_id,
                             content=full_text,
                         )
@@ -12389,15 +12390,19 @@ class GatewayRunner:
                                     adapter.name,
                                 )
                             can_edit = False
-                            await adapter.send(chat_id=source.chat_id, content=msg, metadata=_progress_metadata)
+                            await adapter.send(chat_id=_progress_send_chat_id, content=msg, metadata=_progress_metadata)
+                        elif result.message_id and result.message_id != progress_msg_id:
+                            # `edit_message` may fall back to send() and return the new
+                            # message id when the original target is not editable.
+                            progress_msg_id = result.message_id
                     else:
                         if can_edit:
                             # First tool: send all accumulated text as new message
                             full_text = "\n".join(progress_lines)
-                            result = await adapter.send(chat_id=source.chat_id, content=full_text, metadata=_progress_metadata)
+                            result = await adapter.send(chat_id=_progress_send_chat_id, content=full_text, metadata=_progress_metadata)
                         else:
                             # Editing unsupported: send just this line
-                            result = await adapter.send(chat_id=source.chat_id, content=msg, metadata=_progress_metadata)
+                            result = await adapter.send(chat_id=_progress_send_chat_id, content=msg, metadata=_progress_metadata)
                         if result.success and result.message_id:
                             progress_msg_id = result.message_id
 
@@ -12426,13 +12431,16 @@ class GatewayRunner:
                                 if can_edit and progress_lines and progress_msg_id:
                                     _pending_text = "\n".join(progress_lines)
                                     try:
-                                        await adapter.edit_message(
-                                            chat_id=source.chat_id,
-                                            message_id=progress_msg_id,
+                                        _pending_result = await adapter.edit_message(
+                                            chat_id=_progress_send_chat_id,
+                            message_id=progress_msg_id,
                                             content=_pending_text,
                                         )
                                     except Exception:
                                         pass
+                                    else:
+                                        if _pending_result.message_id:
+                                            progress_msg_id = _pending_result.message_id
                                 progress_msg_id = None
                                 progress_lines = []
                                 last_progress_msg[0] = None
@@ -12446,8 +12454,8 @@ class GatewayRunner:
                         full_text = "\n".join(progress_lines)
                         try:
                             await adapter.edit_message(
-                                chat_id=source.chat_id,
-                                message_id=progress_msg_id,
+                                chat_id=_progress_send_chat_id,
+                            message_id=progress_msg_id,
                                 content=full_text,
                             )
                         except Exception:
