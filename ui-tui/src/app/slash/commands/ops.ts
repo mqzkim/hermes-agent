@@ -7,6 +7,10 @@ import type {
   RollbackDiffResponse,
   RollbackListResponse,
   RollbackRestoreResponse,
+  RunGraphEventsResponse,
+  RunGraphListResponse,
+  RunGraphRun,
+  RunGraphSnapshotResponse,
   SlashExecResponse,
   SpawnTreeListResponse,
   SpawnTreeLoadResponse,
@@ -56,7 +60,168 @@ interface SkillsBrowseResponse {
   total_pages?: number
 }
 
+const fmtRunTime = (value?: null | number): string => {
+  if (!value) {
+    return '—'
+  }
+
+  const ms = value > 10_000_000_000 ? value : value * 1000
+
+  return new Date(ms).toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, 'Z')
+}
+
+const shortId = (id?: null | string): string => {
+  if (!id) {
+    return '—'
+  }
+
+  return id.length > 18 ? `${id.slice(0, 14)}…${id.slice(-4)}` : id
+}
+
+const runLabel = (run: RunGraphRun): string => {
+  const status = run.status || 'unknown'
+  const goal = (run.root_goal || '').replace(/\s+/g, ' ').trim() || '(no goal)'
+
+  return `${shortId(run.run_id)} · ${status} · ${goal.slice(0, 72)}`
+}
+
+const countBy = <T,>(items: T[], keyOf: (item: T) => string | undefined): Record<string, number> => {
+  const out: Record<string, number> = {}
+
+  for (const item of items) {
+    const key = keyOf(item) || 'unknown'
+    out[key] = (out[key] ?? 0) + 1
+  }
+
+  return out
+}
+
+const countRows = (counts: Record<string, number>): [string, string][] =>
+  Object.entries(counts)
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .map(([key, value]) => [key, String(value)])
+
+const panelForRunList = (runs: RunGraphRun[]): PanelSection[] => {
+  if (!runs.length) {
+    return [{ text: 'No persisted RunGraph runs found yet. Run an agent turn first, then retry /runs.' }]
+  }
+
+  return [
+    {
+      rows: runs.slice(0, 12).map(run => [runLabel(run), fmtRunTime(run.started_at)]),
+      title: 'Recent runs'
+    },
+    { text: 'Tip: /runs <run_id> opens a snapshot; /runs <run_id> events shows the event tail.' }
+  ]
+}
+
+const panelForRunSnapshot = (snapshot: RunGraphSnapshotResponse): PanelSection[] => {
+  const run = snapshot.run
+  const nodes = snapshot.nodes ?? []
+  const events = snapshot.events_tail ?? []
+  const sections: PanelSection[] = []
+
+  if (run) {
+    sections.push({
+      rows: [
+        ['Run', run.run_id],
+        ['Status', run.status || 'unknown'],
+        ['Source', run.source || '—'],
+        ['Session', run.session_id || '—'],
+        ['Started', fmtRunTime(run.started_at)],
+        ['Model', [run.provider, run.model].filter(Boolean).join(' / ') || '—'],
+        ['Goal', run.root_goal || '—']
+      ],
+      title: 'Run'
+    })
+  }
+
+  sections.push({
+    rows: [
+      ['Nodes', String(nodes.length)],
+      ['Events tail', String(events.length)],
+      ['Artifacts', String(snapshot.artifacts?.length ?? 0)]
+    ],
+    title: 'Summary'
+  })
+
+  const byNodeType = countRows(countBy(nodes, node => node.node_type))
+
+  if (byNodeType.length) {
+    sections.push({ rows: byNodeType, title: 'Node types' })
+  }
+
+  const recentEvents = events.slice(-8).map(event => [
+    `${event.sequence ?? '—'} · ${event.event_type || 'event'}`,
+    shortId(event.node_id || event.event_id)
+  ] as [string, string])
+
+  if (recentEvents.length) {
+    sections.push({ rows: recentEvents, title: 'Recent events' })
+  }
+
+  return sections
+}
+
+const panelForRunEvents = (runId: string, events: RunGraphEventsResponse['events'] = []): PanelSection[] => {
+  if (!events.length) {
+    return [{ text: `No events found for ${runId}.` }]
+  }
+
+  return [
+    {
+      rows: events.slice(-20).map(event => [
+        `${event.sequence ?? '—'} · ${event.event_type || 'event'}`,
+        `${shortId(event.node_id || event.event_id)} · ${fmtRunTime(event.timestamp)}`
+      ]),
+      title: shortId(runId)
+    }
+  ]
+}
+
 export const opsCommands: SlashCommand[] = [
+  {
+    aliases: ['rungraph', 'run-graph'],
+    help: 'show persisted RunGraph runs or a run snapshot',
+    name: 'runs',
+    usage: '/runs [run_id] [events]',
+    run: (arg, ctx) => {
+      const parts = arg.trim().split(/\s+/).filter(Boolean)
+      const [runId, mode] = parts
+
+      if (!runId) {
+        ctx.gateway
+          .rpc<RunGraphListResponse>('runs.list_recent', { limit: 12 })
+          .then(ctx.guarded<RunGraphListResponse>(r => ctx.transcript.panel('RunGraph', panelForRunList(r.runs ?? []))))
+          .catch(ctx.guardedErr)
+
+        return
+      }
+
+      if ((mode || '').toLowerCase() === 'events') {
+        ctx.gateway
+          .rpc<RunGraphEventsResponse>('runs.events_tail', { limit: 50, run_id: runId })
+          .then(
+            ctx.guarded<RunGraphEventsResponse>(r =>
+              ctx.transcript.panel(`RunGraph events · ${shortId(runId)}`, panelForRunEvents(runId, r.events ?? []))
+            )
+          )
+          .catch(ctx.guardedErr)
+
+        return
+      }
+
+      ctx.gateway
+        .rpc<RunGraphSnapshotResponse>('runs.get_snapshot', { events_limit: 50, run_id: runId })
+        .then(
+          ctx.guarded<RunGraphSnapshotResponse>(r =>
+            ctx.transcript.panel(`RunGraph snapshot · ${shortId(runId)}`, panelForRunSnapshot(r))
+          )
+        )
+        .catch(ctx.guardedErr)
+    }
+  },
+
   {
     help: 'stop background processes',
     name: 'stop',
