@@ -930,6 +930,22 @@ class GatewayStreamConsumer:
                         finalize=finalize,
                     )
                     if result.success:
+                        raw_response = getattr(result, "raw_response", None) or {}
+                        fallback_from = (
+                            raw_response.get("fallback_from_edit_message_id")
+                            if isinstance(raw_response, dict)
+                            else None
+                        )
+                        if fallback_from and getattr(result, "message_id", None):
+                            # The adapter could not edit the old target and
+                            # sent a fresh bot-owned message instead.  Adopt
+                            # that new id so the next streaming update edits
+                            # it instead of repeatedly retrying the stale or
+                            # foreign message id and emitting duplicate
+                            # fallback messages/warnings.
+                            self._message_id = result.message_id
+                            self._message_created_ts = time.monotonic()
+                            self._notify_new_message()
                         self._already_sent = True
                         self._last_sent_text = text
                         # Successful edit — reset flood strike counter
