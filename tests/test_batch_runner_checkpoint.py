@@ -12,7 +12,7 @@ import pytest
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from batch_runner import BatchRunner, _process_batch_worker
+from batch_runner import BatchRunner, _process_batch_worker, _process_single_prompt
 
 
 @pytest.fixture
@@ -160,6 +160,52 @@ class TestResumePreservesProgress:
 
 
 class TestBatchWorkerResumeBehavior:
+    def test_single_prompt_passes_batch_run_metadata_to_agent(self, tmp_path, monkeypatch):
+        config = {
+            "api_key": "test-key",
+            "base_url": "https://example.invalid/v1",
+            "distribution": "default",
+            "max_iterations": 3,
+            "model": "test-model",
+            "output_dir": str(tmp_path),
+            "run_name": "lineage-run",
+            "verbose": False,
+        }
+
+        fake_db = MagicMock()
+        fake_agent = MagicMock()
+        fake_agent.run_conversation.return_value = {
+            "api_calls": 1,
+            "completed": True,
+            "final_response": "ok",
+            "messages": [{"role": "assistant", "content": "ok"}],
+            "run_id": "run-batch-1",
+        }
+        fake_agent._convert_to_trajectory_format.return_value = [{"from": "assistant", "value": "ok"}]
+
+        monkeypatch.setattr("batch_runner.sample_toolsets_from_distribution", lambda _distribution: ["web"])
+        with patch("batch_runner.AIAgent", return_value=fake_agent) as agent_cls, \
+             patch("hermes_state.SessionDB", return_value=fake_db):
+            result = _process_single_prompt(7, {"prompt": "hi"}, 2, config)
+
+        assert result["success"] is True
+        assert result["metadata"]["run_id"] == "run-batch-1"
+        assert result["metadata"]["batch_session_id"] == "batch_lineage-run_b2_p7"
+        fake_db.create_session.assert_called_once_with("batch_lineage-run_b2_p7", source="batch")
+        fake_db.close.assert_called_once()
+        kwargs = agent_cls.call_args.kwargs
+        assert kwargs["platform"] == "batch"
+        assert kwargs["session_id"] == "batch_lineage-run_b2_p7"
+        assert kwargs["session_db"] is fake_db
+        assert kwargs["run_metadata"] == {
+            "batch_run_name": "lineage-run",
+            "batch_num": 2,
+            "batch_prompt_index": 7,
+            "batch_task_id": "task_7",
+            "batch_worker": True,
+            "batch_output_dir": str(tmp_path),
+        }
+
     def test_discarded_no_reasoning_prompts_are_marked_completed(self, tmp_path, monkeypatch):
         batch_file = tmp_path / "batch_1.jsonl"
         prompt_result = {

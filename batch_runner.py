@@ -250,6 +250,9 @@ def _process_single_prompt(
     """
     prompt = prompt_data["prompt"]
     task_id = f"task_{prompt_index}"
+    run_name = config.get("run_name") or "batch"
+    batch_session_id = f"batch_{run_name}_b{batch_num}_p{prompt_index}"
+    session_db = None
     
     # Per-prompt container image override: if the dataset row has an 'image' field,
     # register it for this task's sandbox. Works with Docker, Modal, Singularity, and Daytona.
@@ -308,6 +311,15 @@ def _process_single_prompt(
         
         if config.get("verbose"):
             print(f"   Prompt {prompt_index}: Using toolsets {selected_toolsets}")
+
+        try:
+            from hermes_state import SessionDB
+            session_db = SessionDB()
+            session_db.create_session(batch_session_id, source="batch")
+        except Exception as db_exc:
+            session_db = None
+            if config.get("verbose"):
+                print(f"   Prompt {prompt_index}: RunGraph SessionDB unavailable: {db_exc}")
         
         # Initialize agent with sampled toolsets and log prefix for identification
         log_prefix = f"[B{batch_num}:P{prompt_index}]"
@@ -329,6 +341,17 @@ def _process_single_prompt(
             max_tokens=config.get("max_tokens"),
             reasoning_config=config.get("reasoning_config"),
             prefill_messages=config.get("prefill_messages"),
+            platform="batch",
+            session_id=batch_session_id,
+            session_db=session_db,
+            run_metadata={
+                "batch_run_name": run_name,
+                "batch_num": batch_num,
+                "batch_prompt_index": prompt_index,
+                "batch_task_id": task_id,
+                "batch_worker": True,
+                "batch_output_dir": config.get("output_dir"),
+            },
             skip_context_files=True,  # Don't pollute trajectories with SOUL.md/AGENTS.md
             skip_memory=True,  # Don't use persistent memory in batch runs
         )
@@ -362,7 +385,9 @@ def _process_single_prompt(
             "metadata": {
                 "batch_num": batch_num,
                 "timestamp": datetime.now().isoformat(),
-                "model": config["model"]
+                "model": config["model"],
+                "run_id": result.get("run_id"),
+                "batch_session_id": batch_session_id,
             }
         }
     
@@ -383,6 +408,12 @@ def _process_single_prompt(
                 "timestamp": datetime.now().isoformat()
             }
         }
+    finally:
+        if session_db is not None:
+            try:
+                session_db.close()
+            except Exception:
+                pass
 
 
 def _process_batch_worker(args: Tuple) -> Dict[str, Any]:
@@ -865,6 +896,8 @@ class BatchRunner:
             "max_tokens": self.max_tokens,
             "reasoning_config": self.reasoning_config,
             "prefill_messages": self.prefill_messages,
+            "run_name": self.run_name,
+            "output_dir": str(self.output_dir),
         }
         
         # For backward compatibility, still track by index (but this is secondary to content matching)
