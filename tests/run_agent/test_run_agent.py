@@ -2328,7 +2328,14 @@ class TestRunConversation:
             assert snapshot["run"]["metadata"]["cron_job_name"] == "daily check"
             assert snapshot["run"]["metadata"]["task_id"] == "task-run-graph"
             node_types = [node["node_type"] for node in snapshot["nodes"]]
-            assert node_types == [RunNodeType.MODEL_CALL.value]
+            assert node_types == [RunNodeType.CRON_JOB.value, RunNodeType.MODEL_CALL.value]
+            cron_node = snapshot["nodes"][0]
+            model_node = snapshot["nodes"][1]
+            assert cron_node["title"] == "cron job: daily check"
+            assert cron_node["status"] == RunStatus.SUCCEEDED.value
+            assert model_node["parent_node_id"] == cron_node["node_id"]
+            assert snapshot["node_tree"][0]["node_type"] == RunNodeType.CRON_JOB.value
+            assert snapshot["node_tree"][0]["children"][0]["node_type"] == RunNodeType.MODEL_CALL.value
             event_types = [event["event_type"] for event in snapshot["events_tail"]]
             assert RunEventType.RUN_STARTED.value in event_types
             assert RunEventType.MODEL_REQUEST.value in event_types

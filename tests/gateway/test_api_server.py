@@ -320,6 +320,7 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_get("/v1/responses/{response_id}", adapter._handle_get_response)
     app.router.add_delete("/v1/responses/{response_id}", adapter._handle_delete_response)
     app.router.add_get("/api/runs", adapter._handle_list_run_graphs)
+    app.router.add_get("/api/runs/{run_id}/controls", adapter._handle_get_run_graph_controls)
     app.router.add_get("/api/runs/{run_id}", adapter._handle_get_run_graph_snapshot)
     app.router.add_get("/api/runs/{run_id}/events", adapter._handle_get_run_graph_events)
     return app
@@ -418,6 +419,28 @@ class TestRunGraphReadEndpoints:
 
         assert data == {"events": [{"event_id": "evt_2", "sequence": 2}]}
         db.list_run_event_records.assert_called_once_with("run_1", limit=3, after_sequence=1)
+
+    @pytest.mark.asyncio
+    async def test_get_run_controls_returns_read_only_operator_contract(self, adapter):
+        snapshot = {
+            "run": {"run_id": "run_1", "status": "failed"},
+            "nodes": [{"node_id": "n1", "status": "failed"}],
+        }
+        db = MagicMock()
+        db.get_run_graph_snapshot.return_value = snapshot
+        adapter._session_db = db
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/api/runs/run_1/controls")
+            assert resp.status == 200
+            data = await resp.json()
+
+        assert data["read_only"] is True
+        assert data["failed_node_ids"] == ["n1"]
+        assert data["actions"]["retry_failed_nodes"]["enabled"] is False
+        assert data["actions"]["retry_failed_nodes"]["eligible_node_count"] == 1
+        db.get_run_graph_snapshot.assert_called_once_with("run_1", events_limit=1)
 
 
 # ---------------------------------------------------------------------------

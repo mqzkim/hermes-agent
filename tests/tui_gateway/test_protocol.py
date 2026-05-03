@@ -90,6 +90,24 @@ def test_runs_events_tail_returns_events_after_sequence(server):
     db.list_run_event_records.assert_called_once_with("run_1", limit=3, after_sequence=1)
 
 
+def test_runs_controls_returns_read_only_operator_contract(server):
+    db = MagicMock()
+    db.get_run_graph_snapshot.return_value = {
+        "run": {"run_id": "run_1", "status": "failed"},
+        "nodes": [{"node_id": "n1", "status": "failed"}],
+    }
+    server._db = db
+
+    resp = server.handle_request({"id": "r4", "method": "runs.controls", "params": {"run_id": "run_1"}})
+
+    result = resp["result"]
+    assert result["read_only"] is True
+    assert result["failed_node_ids"] == ["n1"]
+    assert result["actions"]["retry_failed_nodes"]["enabled"] is False
+    assert result["actions"]["retry_failed_nodes"]["eligible_node_count"] == 1
+    db.get_run_graph_snapshot.assert_called_once_with("run_1", events_limit=1)
+
+
 def test_ok_envelope(server):
     assert server._ok("r1", {"x": 1}) == {
         "jsonrpc": "2.0", "id": "r1", "result": {"x": 1},

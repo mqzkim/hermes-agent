@@ -2106,6 +2106,24 @@ def _(rid, params: dict) -> dict:
         return _err(rid, 5006, str(e))
 
 
+@method("runs.controls")
+def _(rid, params: dict) -> dict:
+    run_id = (params.get("run_id") or "").strip()
+    if not run_id:
+        return _err(rid, 4001, "run_id required")
+    db = _get_db()
+    if db is None:
+        return _db_unavailable_error(rid, code=5006)
+    try:
+        snapshot = db.get_run_graph_snapshot(run_id, events_limit=1)
+        if snapshot is None:
+            return _err(rid, 4041, f"run not found: {run_id}")
+        from agent.run_controls import build_run_operator_controls
+        return _ok(rid, build_run_operator_controls(snapshot))
+    except Exception as e:
+        return _err(rid, 5006, str(e))
+
+
 @method("session.most_recent")
 def _(rid, params: dict) -> dict:
     """Return the most recent human-facing session id, or ``None``.

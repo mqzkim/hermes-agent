@@ -185,6 +185,23 @@ export interface RunGraphEventsResponse {
   events?: RunGraphEvent[]
 }
 
+export interface RunGraphControlAction {
+  eligible_node_count?: number
+  enabled: boolean
+  label?: string
+  reason?: string
+}
+
+export interface RunGraphControlsResponse {
+  actions?: Record<string, RunGraphControlAction>
+  failed_node_count?: number
+  failed_node_ids?: string[]
+  read_only?: boolean
+  reason?: string
+  run_id?: null | string
+  run_status?: null | string
+}
+
 export interface SessionTitleResponse {
   pending?: boolean
   session_key?: string

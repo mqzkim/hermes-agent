@@ -9290,6 +9290,34 @@ class AIAgent:
             logger.debug("RunGraph emit failed", exc_info=True)
             return None
 
+    def _run_graph_parent_node_id(self) -> str | None:
+        root_node = getattr(self, "_run_graph_root_node", None)
+        return getattr(root_node, "node_id", None)
+
+    def _run_graph_start_cron_root_node(self, run_metadata: dict | None):
+        """Create an explicit cron_job root node for cron-origin runs."""
+        metadata = dict(run_metadata or {})
+        cron_job_id = metadata.get("cron_job_id")
+        if not cron_job_id:
+            return None
+        title = metadata.get("cron_job_name") or cron_job_id
+        return self._run_graph_start_node(
+            RunNodeType.CRON_JOB,
+            title=f"cron job: {title}",
+            inputs={
+                "cron_job_id": cron_job_id,
+                "cron_job_name": metadata.get("cron_job_name"),
+                "cron_schedule": metadata.get("cron_schedule"),
+                "cron_schedule_display": metadata.get("cron_schedule_display"),
+                "cron_repeat": metadata.get("cron_repeat"),
+            },
+            metadata={
+                "cron_deliver": metadata.get("cron_deliver"),
+                "cron_workdir": metadata.get("cron_workdir"),
+                "cron_origin": metadata.get("cron_origin"),
+            },
+        )
+
     def _run_graph_start_node(
         self,
         node_type: RunNodeType,
@@ -9346,6 +9374,14 @@ class AIAgent:
         if graph is None or getattr(graph, "run", None) is None:
             return None
         try:
+            root_node = getattr(self, "_run_graph_root_node", None)
+            if root_node is not None and getattr(root_node, "ended_at", None) is None:
+                self._run_graph_finish_node(
+                    getattr(root_node, "node_id", None),
+                    outputs=outputs or {},
+                    error=error,
+                    status=status,
+                )
             before = len(graph.events)
             run = graph.finish_run(outputs=outputs or {}, error=error, status=status)
             if run is not None and dispatcher is not None:
@@ -9627,6 +9663,7 @@ class AIAgent:
             run_tool_node = self._run_graph_start_node(
                 RunNodeType.TOOL_CALL,
                 title=f"tool {idx}: {name}",
+                parent_node_id=self._run_graph_parent_node_id(),
                 inputs={
                     "tool_name": name,
                     "tool_call_id": tc.id,
@@ -10068,6 +10105,7 @@ class AIAgent:
                 run_tool_node = self._run_graph_start_node(
                     RunNodeType.TOOL_CALL,
                     title=function_name,
+                    parent_node_id=self._run_graph_parent_node_id(),
                     inputs={
                         "tool_call_id": getattr(tool_call, "id", None),
                         "tool_name": function_name,
@@ -10653,6 +10691,7 @@ class AIAgent:
         self._current_task_id = effective_task_id
         self._run_graph = None
         self._run_graph_dispatcher = None
+        self._run_graph_root_node = None
         try:
             parent_run_id = getattr(self, "_parent_run_id", None)
             parent_run_node_id = getattr(self, "_parent_run_node_id", None)
@@ -10675,6 +10714,7 @@ class AIAgent:
                 self._run_graph_dispatcher = RunLayerDispatcher([PersistenceLayer(self._session_db)])
                 self._run_graph_dispatcher.on_run_start(self._run_graph, self._run_graph.run)
                 self._run_graph_dispatch_existing_events()
+                self._run_graph_root_node = self._run_graph_start_cron_root_node(run_metadata)
             else:
                 self._run_graph = NoopRunGraph()
         except Exception:
@@ -11288,6 +11328,7 @@ class AIAgent:
             run_model_node = self._run_graph_start_node(
                 RunNodeType.MODEL_CALL,
                 title=f"model call #{api_call_count}",
+                parent_node_id=self._run_graph_parent_node_id(),
                 inputs={
                     "api_call_count": api_call_count,
                     "model": self.model,

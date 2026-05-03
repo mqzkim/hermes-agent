@@ -856,6 +856,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_stop": {"method": "POST", "path": "/v1/runs/{run_id}/stop"},
                 "run_graph_list": {"method": "GET", "path": "/api/runs"},
                 "run_graph_snapshot": {"method": "GET", "path": "/api/runs/{run_id}"},
+                "run_graph_controls": {"method": "GET", "path": "/api/runs/{run_id}/controls"},
                 "run_graph_events_tail": {"method": "GET", "path": "/api/runs/{run_id}/events"},
             },
         })
@@ -2123,6 +2124,31 @@ class APIServerAdapter(BasePlatformAdapter):
             logger.debug("RunGraph snapshot endpoint failed: %s", e, exc_info=True)
             return web.json_response({"error": str(e)}, status=500)
 
+    async def _handle_get_run_graph_controls(self, request: "web.Request") -> "web.Response":
+        """GET /api/runs/{run_id}/controls — return read-only operator control matrix."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        run_id = request.match_info.get("run_id", "")
+        db = self._ensure_session_db()
+        if db is None:
+            return web.json_response(
+                _openai_error("state.db unavailable", code="state_db_unavailable"),
+                status=503,
+            )
+        try:
+            snapshot = db.get_run_graph_snapshot(run_id, events_limit=1)
+            if snapshot is None:
+                return web.json_response(
+                    _openai_error(f"Run not found: {run_id}", code="run_not_found"),
+                    status=404,
+                )
+            from agent.run_controls import build_run_operator_controls
+            return web.json_response(build_run_operator_controls(snapshot))
+        except Exception as e:
+            logger.debug("RunGraph controls endpoint failed: %s", e, exc_info=True)
+            return web.json_response({"error": str(e)}, status=500)
+
     async def _handle_get_run_graph_events(self, request: "web.Request") -> "web.Response":
         """GET /api/runs/{run_id}/events — return persisted RunGraph event tail."""
         auth_err = self._check_auth(request)
@@ -2868,6 +2894,7 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_delete("/v1/responses/{response_id}", self._handle_delete_response)
             # Persisted RunGraph read API for operator UIs
             self._app.router.add_get("/api/runs", self._handle_list_run_graphs)
+            self._app.router.add_get("/api/runs/{run_id}/controls", self._handle_get_run_graph_controls)
             self._app.router.add_get("/api/runs/{run_id}", self._handle_get_run_graph_snapshot)
             self._app.router.add_get("/api/runs/{run_id}/events", self._handle_get_run_graph_events)
             # Cron jobs management API
