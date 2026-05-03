@@ -9620,6 +9620,32 @@ class AIAgent:
                 except Exception as cb_err:
                     logging.debug(f"Tool start callback error: {cb_err}")
 
+        run_tool_nodes = []
+        for idx, (tc, name, args, _block_result, _blocked_by_guardrail) in enumerate(parsed_calls, 1):
+            run_tool_node = self._run_graph_start_node(
+                RunNodeType.TOOL_CALL,
+                title=f"tool {idx}: {name}",
+                inputs={
+                    "tool_name": name,
+                    "tool_call_id": tc.id,
+                    "api_call_count": api_call_count,
+                    "parallel": True,
+                    "arguments": args,
+                },
+            )
+            run_tool_nodes.append(run_tool_node)
+            self._run_graph_emit(
+                RunEventType.TOOL_INVOCATION,
+                node_id=getattr(run_tool_node, "node_id", None),
+                payload={
+                    "tool_name": name,
+                    "tool_call_id": tc.id,
+                    "api_call_count": api_call_count,
+                    "parallel": True,
+                    "arguments": args,
+                },
+            )
+
         # ── Concurrent execution ─────────────────────────────────────────
         # Each slot holds (function_name, function_args, function_result, duration, error_flag, blocked_flag)
         results = [None] * num_tools
@@ -9733,7 +9759,9 @@ class AIAgent:
                 max_workers = min(len(runnable_calls), _MAX_TOOL_WORKERS)
                 with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
                     for i, tc, name, args in runnable_calls:
-                        # Propagate ContextVars (e.g. _approval_session_key); mirrors asyncio.to_thread.
+                        # Propagate ContextVars (e.g. _approval_session_key and the
+                        # current run_graph_context) so tools such as delegate_task
+                        # can see the parent RunGraph.
                         ctx = contextvars.copy_context()
                         f = executor.submit(ctx.run, _run_tool, i, tc, name, args)
                         futures.append(f)
@@ -9844,6 +9872,32 @@ class AIAgent:
 
             self._current_tool = None
             self._touch_activity(f"tool completed: {name} ({tool_duration:.1f}s)")
+
+            run_tool_node = run_tool_nodes[i] if i < len(run_tool_nodes) else None
+            tool_is_error = False if r is None and self._interrupt_requested else True if r is None else bool(is_error)
+            self._run_graph_emit(
+                RunEventType.TOOL_RESULT,
+                node_id=getattr(run_tool_node, "node_id", None),
+                payload={
+                    "tool_name": name,
+                    "tool_call_id": tc.id,
+                    "duration": tool_duration,
+                    "is_error": tool_is_error,
+                    "result_chars": len(function_result or ""),
+                    "parallel": True,
+                },
+            )
+            self._run_graph_finish_node(
+                getattr(run_tool_node, "node_id", None),
+                outputs={
+                    "duration": tool_duration,
+                    "is_error": tool_is_error,
+                    "result_chars": len(function_result or ""),
+                    "parallel": True,
+                },
+                error=function_result if tool_is_error else None,
+                status=RunStatus.CANCELLED if r is None and self._interrupt_requested else RunStatus.FAILED if tool_is_error else RunStatus.SUCCEEDED,
+            )
 
             if not blocked and self.tool_complete_callback:
                 try:

@@ -22,7 +22,7 @@ import run_agent
 from run_agent import AIAgent
 from agent.error_classifier import FailoverReason
 from agent.prompt_builder import DEFAULT_AGENT_IDENTITY
-from agent.run_events import RunEventType, RunNodeType
+from agent.run_events import RunEventType, RunNodeType, RunStatus
 from agent.run_layers import current_run_graph
 from hermes_state import SessionDB
 
@@ -2369,6 +2369,48 @@ class TestRunConversation:
             event_types = [event["event_type"] for event in snapshot["events_tail"]]
             assert RunEventType.TOOL_INVOCATION.value in event_types
             assert RunEventType.TOOL_RESULT.value in event_types
+        finally:
+            db.close()
+
+    def test_concurrent_tool_execution_propagates_run_graph_and_persists_tool_nodes(self, agent, tmp_path):
+        self._setup_agent(agent)
+        db = SessionDB(tmp_path / "state.db")
+        try:
+            db.create_session(session_id=agent.session_id, source="cli")
+            agent._session_db = db
+            tc1 = _mock_tool_call(name="web_search", arguments='{"q":"one"}', call_id="c1")
+            tc2 = _mock_tool_call(name="web_search", arguments='{"q":"two"}', call_id="c2")
+            resp1 = _mock_response(content="", finish_reason="tool_calls", tool_calls=[tc1, tc2])
+            resp2 = _mock_response(content="Done searching", finish_reason="stop")
+            agent.client.chat.completions.create.side_effect = [resp1, resp2]
+            seen_run_ids = []
+
+            def _tool_result(function_name, function_args, *args, **kwargs):
+                graph = current_run_graph()
+                assert graph is not None
+                assert graph.run is not None
+                seen_run_ids.append(graph.run.run_id)
+                return f"search result for {function_args['q']}"
+
+            with (
+                patch("run_agent.handle_function_call", side_effect=_tool_result),
+                patch.object(agent, "_persist_session"),
+                patch.object(agent, "_save_trajectory"),
+                patch.object(agent, "_cleanup_task_resources"),
+            ):
+                result = agent.run_conversation("search two things", task_id="task-run-graph-concurrent-tools")
+
+            assert result["completed"] is True
+            assert sorted(seen_run_ids) == [result["run_id"], result["run_id"]]
+            snapshot = db.get_run_graph_snapshot(result["run_id"])
+            tool_nodes = [node for node in snapshot["nodes"] if node["node_type"] == RunNodeType.TOOL_CALL.value]
+            assert len(tool_nodes) == 2
+            assert {node["inputs"]["tool_call_id"] for node in tool_nodes} == {"c1", "c2"}
+            assert {node["status"] for node in tool_nodes} == {RunStatus.SUCCEEDED.value}
+            assert {node["outputs"]["is_error"] for node in tool_nodes} == {False}
+            event_types = [event["event_type"] for event in snapshot["events_tail"]]
+            assert event_types.count(RunEventType.TOOL_INVOCATION.value) == 2
+            assert event_types.count(RunEventType.TOOL_RESULT.value) == 2
         finally:
             db.close()
 
