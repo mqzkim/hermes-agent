@@ -53,6 +53,43 @@ def test_unknown_method(server):
     assert resp["error"]["code"] == -32601
 
 
+def test_runs_list_recent_returns_run_dicts(server):
+    run = types.SimpleNamespace(to_dict=lambda: {"run_id": "run_1", "status": "succeeded"})
+    db = MagicMock()
+    db.list_recent_runs.return_value = [run]
+    server._db = db
+
+    resp = server.handle_request({"id": "r1", "method": "runs.list_recent", "params": {"limit": 7}})
+
+    assert resp["result"] == {"runs": [{"run_id": "run_1", "status": "succeeded"}]}
+    db.list_recent_runs.assert_called_once_with(limit=7)
+
+
+def test_runs_get_snapshot_returns_stable_missing_run_error(server):
+    db = MagicMock()
+    db.get_run_graph_snapshot.return_value = None
+    server._db = db
+
+    resp = server.handle_request({"id": "r2", "method": "runs.get_snapshot", "params": {"run_id": "missing"}})
+
+    assert resp["error"]["code"] == 4041
+    assert "run not found" in resp["error"]["message"]
+
+
+def test_runs_events_tail_returns_events_after_sequence(server):
+    event = types.SimpleNamespace(to_dict=lambda: {"event_id": "evt_2", "sequence": 2})
+    db = MagicMock()
+    db.list_run_event_records.return_value = [event]
+    server._db = db
+
+    resp = server.handle_request(
+        {"id": "r3", "method": "runs.events_tail", "params": {"run_id": "run_1", "limit": 3, "after_sequence": 1}}
+    )
+
+    assert resp["result"] == {"events": [{"event_id": "evt_2", "sequence": 2}]}
+    db.list_run_event_records.assert_called_once_with("run_1", limit=3, after_sequence=1)
+
+
 def test_ok_envelope(server):
     assert server._ok("r1", {"x": 1}) == {
         "jsonrpc": "2.0", "id": "r1", "result": {"x": 1},
@@ -298,7 +335,7 @@ def test_session_resume_returns_hydrated_messages(server, monkeypatch):
         def reopen_session(self, _sid):
             return None
 
-        def get_messages_as_conversation(self, _sid, include_ancestors=False):
+        def get_messages_as_conversation(self, _sid, include_ancestors=False, *args, **kwargs):
             return [
                 {"role": "user", "content": "hello"},
                 {"role": "assistant", "content": "yo"},
