@@ -722,6 +722,10 @@ class TestRunJobSessionPersistence:
             "id": "test-job",
             "name": "test",
             "prompt": "hello",
+            "schedule": "0 9 * * *",
+            "schedule_display": "daily at 09:00",
+            "deliver": "origin",
+            "repeat": 3,
         }
         fake_db = MagicMock()
 
@@ -740,7 +744,7 @@ class TestRunJobSessionPersistence:
              ), \
              patch("run_agent.AIAgent") as mock_agent_cls:
             mock_agent = MagicMock()
-            mock_agent.run_conversation.return_value = {"final_response": "ok"}
+            mock_agent.run_conversation.return_value = {"final_response": "ok", "run_id": "run-cron-1"}
             mock_agent_cls.return_value = mock_agent
 
             success, output, final_response, error = run_job(job)
@@ -749,10 +753,21 @@ class TestRunJobSessionPersistence:
         assert error is None
         assert final_response == "ok"
         assert "ok" in output
+        assert "**RunGraph Run ID:** run-cron-1" in output
 
         kwargs = mock_agent_cls.call_args.kwargs
         assert kwargs["session_db"] is fake_db
         assert kwargs["platform"] == "cron"
+        assert kwargs["run_metadata"] == {
+            "cron_job_id": "test-job",
+            "cron_job_name": "test",
+            "cron_schedule": "0 9 * * *",
+            "cron_schedule_display": "daily at 09:00",
+            "cron_deliver": "origin",
+            "cron_repeat": 3,
+            "cron_workdir": None,
+            "cron_origin": None,
+        }
         assert kwargs["skip_memory"] is False
         assert kwargs["suppress_memory_prompt"] is True
         assert kwargs["session_id"].startswith("cron_test-job_")
@@ -1106,6 +1121,8 @@ class TestRunJobSessionPersistence:
         fake_db = MagicMock()
 
         with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._LOCK_DIR", tmp_path / "cron"), \
+             patch("cron.scheduler._LOCK_FILE", tmp_path / "cron" / ".tick.lock"), \
              patch("cron.scheduler.get_due_jobs", return_value=[job]), \
              patch("cron.scheduler.advance_next_run"), \
              patch("cron.scheduler.mark_job_run") as mock_mark, \

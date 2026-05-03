@@ -954,6 +954,7 @@ class AIAgent:
         suppress_memory_prompt: bool = False,
         session_db=None,
         parent_session_id: str = None,
+        run_metadata: Dict[str, Any] = None,
         iteration_budget: "IterationBudget" = None,
         fallback_model: Dict[str, Any] = None,
         credential_pool=None,
@@ -1031,6 +1032,7 @@ class AIAgent:
         self._chat_type = chat_type
         self._thread_id = thread_id
         self._gateway_session_key = gateway_session_key  # Stable per-chat key (e.g. agent:main:telegram:dm:123)
+        self._run_metadata = dict(run_metadata or {})
         # Pluggable print function — CLI replaces this with _cprint so that
         # raw ANSI status lines are routed through prompt_toolkit's renderer
         # instead of going directly to stdout where patch_stdout's StdoutProxy
@@ -10655,6 +10657,12 @@ class AIAgent:
             parent_run_id = getattr(self, "_parent_run_id", None)
             parent_run_node_id = getattr(self, "_parent_run_node_id", None)
             if self._session_db:
+                run_metadata = dict(getattr(self, "_run_metadata", {}) or {})
+                run_metadata.update({
+                    "task_id": effective_task_id,
+                    "api_mode": self.api_mode,
+                    "parent_run_node_id": parent_run_node_id,
+                })
                 self._run_graph = RunGraph.start(
                     session_id=self.session_id,
                     source=self.platform or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
@@ -10662,11 +10670,7 @@ class AIAgent:
                     parent_run_id=parent_run_id,
                     model=self.model,
                     provider=self.provider,
-                    metadata={
-                        "task_id": effective_task_id,
-                        "api_mode": self.api_mode,
-                        "parent_run_node_id": parent_run_node_id,
-                    },
+                    metadata=run_metadata,
                 )
                 self._run_graph_dispatcher = RunLayerDispatcher([PersistenceLayer(self._session_db)])
                 self._run_graph_dispatcher.on_run_start(self._run_graph, self._run_graph.run)

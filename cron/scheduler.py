@@ -1082,6 +1082,16 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             platform="cron",
             session_id=_cron_session_id,
             session_db=_session_db,
+            run_metadata={
+                "cron_job_id": job_id,
+                "cron_job_name": job_name,
+                "cron_schedule": job.get("schedule"),
+                "cron_schedule_display": job.get("schedule_display"),
+                "cron_deliver": job.get("deliver"),
+                "cron_repeat": job.get("repeat"),
+                "cron_workdir": _job_workdir,
+                "cron_origin": origin,
+            },
         )
         
         # Run the agent with an *inactivity*-based timeout: the job can run
@@ -1194,6 +1204,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             raise RuntimeError(_err_text)
 
         final_response = result.get("final_response", "") or ""
+        run_id = result.get("run_id") or ""
         # Strip leaked placeholder text that upstream may inject on empty completions.
         if final_response.strip() == "(No response generated)":
             final_response = ""
@@ -1204,6 +1215,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         output = f"""# Cron Job: {job_name}
 
 **Job ID:** {job_id}
+**RunGraph Run ID:** {run_id or 'N/A'}
 **Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}
 **Schedule:** {job.get('schedule_display', 'N/A')}
 

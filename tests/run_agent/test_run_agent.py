@@ -2304,6 +2304,11 @@ class TestRunConversation:
         try:
             db.create_session(session_id=agent.session_id, source="cli")
             agent._session_db = db
+            agent._run_metadata = {
+                "cron_job_id": "job-123",
+                "cron_job_name": "daily check",
+                "cron_schedule": "0 9 * * *",
+            }
             resp = _mock_response(content="Final answer", finish_reason="stop")
             agent.client.chat.completions.create.return_value = resp
 
@@ -2319,6 +2324,9 @@ class TestRunConversation:
             snapshot = db.get_run_graph_snapshot(result["run_id"])
             assert snapshot is not None
             assert snapshot["run"]["root_goal"] == "hello"
+            assert snapshot["run"]["metadata"]["cron_job_id"] == "job-123"
+            assert snapshot["run"]["metadata"]["cron_job_name"] == "daily check"
+            assert snapshot["run"]["metadata"]["task_id"] == "task-run-graph"
             node_types = [node["node_type"] for node in snapshot["nodes"]]
             assert node_types == [RunNodeType.MODEL_CALL.value]
             event_types = [event["event_type"] for event in snapshot["events_tail"]]
