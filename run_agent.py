@@ -108,6 +108,9 @@ from model_tools import (
     handle_function_call,
     check_toolset_requirements,
 )
+from agent.run_events import RunEventType, RunNodeType, RunStatus
+from agent.run_graph import NoopRunGraph, RunGraph
+from agent.run_layers import PersistenceLayer, RunLayerDispatcher, run_graph_context
 from tools.terminal_tool import cleanup_vm, get_active_env, is_persistent_env
 from tools.terminal_tool import (
     set_approval_callback as _set_approval_callback,
@@ -9021,6 +9024,95 @@ class AIAgent:
         )
         return compressed, new_system_prompt
 
+    def _run_graph_dispatch_existing_events(self) -> None:
+        graph = getattr(self, "_run_graph", None)
+        dispatcher = getattr(self, "_run_graph_dispatcher", None)
+        if graph is None or dispatcher is None:
+            return
+        for event in getattr(graph, "events", []):
+            dispatcher.on_event(graph, event)
+
+    def _run_graph_emit(self, event_type: RunEventType, *, node_id: str | None = None, payload: dict | None = None):
+        graph = getattr(self, "_run_graph", None)
+        dispatcher = getattr(self, "_run_graph_dispatcher", None)
+        if graph is None or getattr(graph, "run", None) is None:
+            return None
+        try:
+            event = graph.emit(event_type, node_id=node_id, payload=payload or {})
+            if dispatcher is not None:
+                dispatcher.on_event(graph, event)
+            return event
+        except Exception:
+            logger.debug("RunGraph emit failed", exc_info=True)
+            return None
+
+    def _run_graph_start_node(
+        self,
+        node_type: RunNodeType,
+        *,
+        title: str,
+        parent_node_id: str | None = None,
+        inputs: dict | None = None,
+        metadata: dict | None = None,
+    ):
+        graph = getattr(self, "_run_graph", None)
+        dispatcher = getattr(self, "_run_graph_dispatcher", None)
+        if graph is None or getattr(graph, "run", None) is None:
+            return None
+        try:
+            before = len(graph.events)
+            node = graph.start_node(
+                node_type,
+                title=title,
+                parent_node_id=parent_node_id,
+                inputs=inputs or {},
+                metadata=metadata or {},
+            )
+            if dispatcher is not None:
+                dispatcher.on_node_start(graph, node)
+                for event in graph.events[before:]:
+                    dispatcher.on_event(graph, event)
+            return node
+        except Exception:
+            logger.debug("RunGraph node start failed", exc_info=True)
+            return None
+
+    def _run_graph_finish_node(self, node_id: str | None, *, outputs: dict | None = None, error: str | None = None, status: RunStatus | None = None):
+        if not node_id:
+            return None
+        graph = getattr(self, "_run_graph", None)
+        dispatcher = getattr(self, "_run_graph_dispatcher", None)
+        if graph is None or getattr(graph, "run", None) is None:
+            return None
+        try:
+            before = len(graph.events)
+            node = graph.finish_node(node_id, outputs=outputs or {}, error=error, status=status)
+            if node is not None and dispatcher is not None:
+                dispatcher.on_node_end(graph, node)
+                for event in graph.events[before:]:
+                    dispatcher.on_event(graph, event)
+            return node
+        except Exception:
+            logger.debug("RunGraph node finish failed", exc_info=True)
+            return None
+
+    def _run_graph_finish_run(self, *, outputs: dict | None = None, error: str | None = None, status: RunStatus | None = None):
+        graph = getattr(self, "_run_graph", None)
+        dispatcher = getattr(self, "_run_graph_dispatcher", None)
+        if graph is None or getattr(graph, "run", None) is None:
+            return None
+        try:
+            before = len(graph.events)
+            run = graph.finish_run(outputs=outputs or {}, error=error, status=status)
+            if run is not None and dispatcher is not None:
+                dispatcher.on_run_end(graph, run)
+                for event in graph.events[before:]:
+                    dispatcher.on_event(graph, event)
+            return run
+        except Exception:
+            logger.debug("RunGraph run finish failed", exc_info=True)
+            return None
+
     def _execute_tool_calls(self, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0) -> None:
         """Execute tool calls from the assistant message and append results to messages.
 
@@ -9033,14 +9125,15 @@ class AIAgent:
         # Allow _vprint during tool execution even with stream consumers
         self._executing_tools = True
         try:
-            if not _should_parallelize_tool_batch(tool_calls):
-                return self._execute_tool_calls_sequential(
+            with run_graph_context(getattr(self, "_run_graph", None)):
+                if not _should_parallelize_tool_batch(tool_calls):
+                    return self._execute_tool_calls_sequential(
+                        assistant_message, messages, effective_task_id, api_call_count
+                    )
+
+                return self._execute_tool_calls_concurrent(
                     assistant_message, messages, effective_task_id, api_call_count
                 )
-
-            return self._execute_tool_calls_concurrent(
-                assistant_message, messages, effective_task_id, api_call_count
-            )
         finally:
             self._executing_tools = False
 
@@ -9613,6 +9706,27 @@ class AIAgent:
                     pass  # never block tool execution
 
             tool_start_time = time.time()
+            run_tool_node = None
+            if _block_msg is None:
+                run_tool_node = self._run_graph_start_node(
+                    RunNodeType.TOOL_CALL,
+                    title=function_name,
+                    inputs={
+                        "tool_call_id": getattr(tool_call, "id", None),
+                        "tool_name": function_name,
+                        "arguments": function_args,
+                        "api_call_count": api_call_count,
+                    },
+                )
+                self._run_graph_emit(
+                    RunEventType.TOOL_INVOCATION,
+                    node_id=getattr(run_tool_node, "node_id", None),
+                    payload={
+                        "tool_call_id": getattr(tool_call, "id", None),
+                        "tool_name": function_name,
+                        "api_call_count": api_call_count,
+                    },
+                )
 
             if _block_msg is not None:
                 # Tool blocked by plugin policy — return error without executing.
@@ -9805,6 +9919,27 @@ class AIAgent:
                 logger.warning("Tool %s returned error (%.2fs): %s", function_name, tool_duration, result_preview)
             else:
                 logger.info("tool %s completed (%.2fs, %d chars)", function_name, tool_duration, len(function_result))
+            self._run_graph_emit(
+                RunEventType.TOOL_RESULT,
+                node_id=getattr(run_tool_node, "node_id", None),
+                payload={
+                    "tool_call_id": getattr(tool_call, "id", None),
+                    "tool_name": function_name,
+                    "duration": tool_duration,
+                    "is_error": _is_error_result,
+                    "result_preview": result_preview,
+                },
+            )
+            self._run_graph_finish_node(
+                getattr(run_tool_node, "node_id", None),
+                outputs={
+                    "duration": tool_duration,
+                    "is_error": _is_error_result,
+                    "result_preview": result_preview,
+                },
+                error=result_preview if _is_error_result else None,
+                status=RunStatus.FAILED if _is_error_result else RunStatus.SUCCEEDED,
+            )
 
             if self.tool_progress_callback:
                 try:
@@ -10135,6 +10270,34 @@ class AIAgent:
         # state registry.  Set BEFORE any tool dispatch so snapshots taken at
         # child-launch time see the parent's real id, not None.
         self._current_task_id = effective_task_id
+        self._run_graph = None
+        self._run_graph_dispatcher = None
+        try:
+            parent_run_id = getattr(self, "_parent_run_id", None)
+            parent_run_node_id = getattr(self, "_parent_run_node_id", None)
+            if self._session_db:
+                self._run_graph = RunGraph.start(
+                    session_id=self.session_id,
+                    source=self.platform or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
+                    root_goal=_summarize_user_message_for_log(user_message),
+                    parent_run_id=parent_run_id,
+                    model=self.model,
+                    provider=self.provider,
+                    metadata={
+                        "task_id": effective_task_id,
+                        "api_mode": self.api_mode,
+                        "parent_run_node_id": parent_run_node_id,
+                    },
+                )
+                self._run_graph_dispatcher = RunLayerDispatcher([PersistenceLayer(self._session_db)])
+                self._run_graph_dispatcher.on_run_start(self._run_graph, self._run_graph.run)
+                self._run_graph_dispatch_existing_events()
+            else:
+                self._run_graph = NoopRunGraph()
+        except Exception:
+            logger.debug("RunGraph start failed", exc_info=True)
+            self._run_graph = NoopRunGraph()
+            self._run_graph_dispatcher = None
         
         # Reset retry counters and iteration budget at the start of each turn
         # so subagent usage from a previous turn doesn't eat into the next one.
@@ -10737,6 +10900,32 @@ class AIAgent:
                 logging.debug(f"Total message size: ~{approx_tokens:,} tokens")
             
             api_start_time = time.time()
+            run_model_node = self._run_graph_start_node(
+                RunNodeType.MODEL_CALL,
+                title=f"model call #{api_call_count}",
+                inputs={
+                    "api_call_count": api_call_count,
+                    "model": self.model,
+                    "provider": self.provider,
+                    "api_mode": self.api_mode,
+                    "message_count": len(api_messages),
+                    "tool_count": len(self.tools or []),
+                    "approx_input_tokens": approx_tokens,
+                },
+            )
+            self._run_graph_emit(
+                RunEventType.MODEL_REQUEST,
+                node_id=getattr(run_model_node, "node_id", None),
+                payload={
+                    "api_call_count": api_call_count,
+                    "model": self.model,
+                    "provider": self.provider,
+                    "api_mode": self.api_mode,
+                    "message_count": len(api_messages),
+                    "tool_count": len(self.tools or []),
+                    "approx_input_tokens": approx_tokens,
+                },
+            )
             retry_count = 0
             max_retries = self._api_max_retries
             primary_recovery_attempted = False
@@ -12564,6 +12753,29 @@ class AIAgent:
                 except Exception:
                     pass
 
+                _assistant_tool_calls_for_graph = getattr(assistant_message, "tool_calls", None) or []
+                _assistant_text_for_graph = assistant_message.content or ""
+                self._run_graph_emit(
+                    RunEventType.MODEL_RESPONSE,
+                    node_id=getattr(run_model_node, "node_id", None),
+                    payload={
+                        "api_call_count": api_call_count,
+                        "finish_reason": finish_reason,
+                        "assistant_content_chars": len(_assistant_text_for_graph),
+                        "assistant_tool_call_count": len(_assistant_tool_calls_for_graph),
+                        "response_model": getattr(response, "model", None),
+                    },
+                )
+                self._run_graph_finish_node(
+                    getattr(run_model_node, "node_id", None),
+                    outputs={
+                        "finish_reason": finish_reason,
+                        "assistant_content_chars": len(_assistant_text_for_graph),
+                        "assistant_tool_call_count": len(_assistant_tool_calls_for_graph),
+                        "response_model": getattr(response, "model", None),
+                    },
+                )
+
                 # Handle assistant response
                 if assistant_message.content and not self.quiet_mode:
                     if self.verbose_logging:
@@ -13436,6 +13648,13 @@ class AIAgent:
                 last_reasoning = msg["reasoning"]
                 break
 
+        run_record = self._run_graph_finish_run(
+            outputs={"final_response_chars": len(final_response or ""), "api_calls": api_call_count},
+            error=None if completed else (_turn_exit_reason or "run did not complete"),
+            status=RunStatus.SUCCEEDED if completed else RunStatus.FAILED,
+        )
+        run_id = getattr(run_record, "run_id", None) or getattr(getattr(self, "_run_graph", None), "run", None) and self._run_graph.run.run_id
+
         # Build result with interrupt info if applicable
         result = {
             "final_response": final_response,
@@ -13462,6 +13681,8 @@ class AIAgent:
             "cost_status": self.session_cost_status,
             "cost_source": self.session_cost_source,
         }
+        if run_id:
+            result["run_id"] = run_id
         # If a /steer landed after the final assistant turn (no more tool
         # batches to drain into), hand it back to the caller so it can be
         # delivered as the next user turn instead of being silently lost.

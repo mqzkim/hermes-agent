@@ -35,6 +35,19 @@ from tools import file_state
 from tools.terminal_tool import set_approval_callback as _set_subagent_approval_cb
 from utils import base_url_hostname, is_truthy_value
 
+try:
+    from agent.run_events import RunEventType, RunNodeType, RunStatus
+    from agent.run_graph import RunGraph
+    from agent.run_layers import current_run_graph
+except Exception:  # pragma: no cover - delegation must degrade if RunGraph imports are unavailable
+    RunEventType = None  # type: ignore[assignment]
+    RunNodeType = None  # type: ignore[assignment]
+    RunStatus = None  # type: ignore[assignment]
+    RunGraph = None  # type: ignore[assignment]
+
+    def current_run_graph():  # type: ignore[no-redef]
+        return None
+
 
 # Tools that children must never have access to
 DELEGATE_BLOCKED_TOOLS = frozenset(
@@ -77,6 +90,104 @@ def _resolve_explicit_command_transport(command: str) -> tuple[str, Optional[str
     if name in {"claude", "codex"}:
         return "local-cli", f"local-cli://{name}", "chat_completions"
     return "copilot-acp", None, "chat_completions"
+
+
+def _active_parent_run_graph(parent_agent=None):
+    """Return the active parent RunGraph, if delegation is running inside one."""
+    graph = current_run_graph()
+    if graph is not None and getattr(graph, "run", None) is not None:
+        return graph
+    graph = getattr(parent_agent, "_run_graph", None) if parent_agent is not None else None
+    if graph is not None and getattr(graph, "run", None) is not None:
+        return graph
+    return None
+
+
+def _start_subagent_run_node(graph, *, task_index: int, task: Dict[str, Any], child=None):
+    """Record a delegate child as a subagent node in the parent RunGraph."""
+    if graph is None or RunNodeType is None or RunEventType is None:
+        return None
+    goal = str(task.get("goal", ""))
+    role = getattr(child, "_delegate_role", None) if child is not None else task.get("role")
+    model = getattr(child, "model", None) if child is not None else None
+    provider = getattr(child, "provider", None) if child is not None else None
+    subagent_id = getattr(child, "_subagent_id", None) if child is not None else None
+    try:
+        node = graph.start_node(
+            RunNodeType.SUBAGENT,
+            title=f"subagent {task_index}: {goal[:80]}",
+            inputs={
+                "task_index": task_index,
+                "goal": goal,
+                "context_present": bool(task.get("context")),
+                "toolsets": task.get("toolsets"),
+                "role": role,
+                "model": model if isinstance(model, str) else None,
+                "provider": provider if isinstance(provider, str) else None,
+                "subagent_id": subagent_id if isinstance(subagent_id, str) else None,
+            },
+        )
+        graph.emit(
+            RunEventType.SUBAGENT_SPAWNED,
+            node_id=node.node_id,
+            payload={
+                "task_index": task_index,
+                "goal": goal,
+                "role": role,
+                "subagent_id": subagent_id if isinstance(subagent_id, str) else None,
+            },
+        )
+        if child is not None:
+            try:
+                child._parent_run_id = graph.run.run_id
+                child._parent_run_node_id = node.node_id
+                child._delegate_run_node_id = node.node_id
+            except Exception:
+                logger.debug("Failed to attach RunGraph parent linkage to child", exc_info=True)
+        return node
+    except Exception:
+        logger.debug("Failed to record subagent RunGraph node", exc_info=True)
+        return None
+
+
+def _finish_subagent_run_node(graph, node, result: Dict[str, Any] | None) -> None:
+    """Finish a parent subagent RunGraph node from a delegate result entry."""
+    if graph is None or node is None or RunStatus is None or RunEventType is None:
+        return
+    result = result or {}
+    result_status = result.get("status")
+    if result_status == "completed":
+        node_status = RunStatus.SUCCEEDED
+        error = None
+    elif result_status == "interrupted":
+        node_status = RunStatus.CANCELLED
+        error = result.get("error") or "Subagent interrupted"
+    else:
+        node_status = RunStatus.FAILED
+        error = result.get("error") or "Subagent did not complete successfully"
+    outputs = {
+        "task_index": result.get("task_index"),
+        "status": result_status,
+        "summary": result.get("summary"),
+        "api_calls": result.get("api_calls"),
+        "duration_seconds": result.get("duration_seconds"),
+        "exit_reason": result.get("exit_reason"),
+        "model": result.get("model"),
+    }
+    try:
+        graph.emit(
+            RunEventType.SUBAGENT_COMPLETED,
+            node_id=node.node_id,
+            payload={
+                "task_index": result.get("task_index"),
+                "status": result_status,
+                "error": error,
+                "duration_seconds": result.get("duration_seconds"),
+            },
+        )
+        graph.finish_node(node.node_id, outputs=outputs, error=error, status=node_status)
+    except Exception:
+        logger.debug("Failed to finish subagent RunGraph node", exc_info=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1971,6 +2082,7 @@ def delegate_task(
     # Wrapped in try/finally so the global is always restored even if a
     # child build raises (otherwise _last_resolved_tool_names stays corrupted).
     children = []
+    parent_run_graph = _active_parent_run_graph(parent_agent)
     try:
         for i, t in enumerate(task_list):
             task_acp_args = t.get("acp_args") if "acp_args" in t else None
@@ -2002,15 +2114,22 @@ def delegate_task(
             )
             # Override with correct parent tool names (before child construction mutated global)
             child._delegate_saved_tool_names = _parent_tool_names
-            children.append((i, t, child))
+            run_node = _start_subagent_run_node(
+                parent_run_graph,
+                task_index=i,
+                task={**t, "role": effective_role, "toolsets": t.get("toolsets") or toolsets},
+                child=child,
+            )
+            children.append((i, t, child, run_node))
     finally:
         # Authoritative restore: reset global to parent's tool names after all children built
         _model_tools._last_resolved_tool_names = _parent_tool_names
 
     if n_tasks == 1:
         # Single task -- run directly (no thread pool overhead)
-        _i, _t, child = children[0]
+        _i, _t, child, run_node = children[0]
         result = _run_single_child(0, _t["goal"], child, parent_agent)
+        _finish_subagent_run_node(parent_run_graph, run_node, result)
         results.append(result)
     else:
         # Batch -- run in parallel with per-task progress lines
@@ -2019,7 +2138,9 @@ def delegate_task(
 
         with ThreadPoolExecutor(max_workers=max_children) as executor:
             futures = {}
-            for i, t, child in children:
+            run_node_by_index = {}
+            for i, t, child, run_node in children:
+                run_node_by_index[i] = run_node
                 future = executor.submit(
                     _run_single_child,
                     task_index=i,
@@ -2036,7 +2157,7 @@ def delegate_task(
             # when the parent is interrupted.
             # Map task_index -> child agent, so fabricated entries for
             # still-pending futures can carry the correct _delegate_role.
-            _child_by_index = {i: child for (i, _, child) in children}
+            _child_by_index = {i: child for (i, _, child, _) in children}
 
             pending = set(futures.keys())
             while pending:
@@ -2073,6 +2194,7 @@ def delegate_task(
                                     _child_by_index.get(idx), "_delegate_role", None
                                 ),
                             }
+                        _finish_subagent_run_node(parent_run_graph, run_node_by_index.get(idx), entry)
                         results.append(entry)
                         completed_count += 1
                     break
@@ -2098,6 +2220,7 @@ def delegate_task(
                                 _child_by_index.get(idx), "_delegate_role", None
                             ),
                         }
+                    _finish_subagent_run_node(parent_run_graph, run_node_by_index.get(entry.get("task_index")), entry)
                     results.append(entry)
                     completed_count += 1
 
