@@ -319,6 +319,9 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_post("/v1/responses", adapter._handle_responses)
     app.router.add_get("/v1/responses/{response_id}", adapter._handle_get_response)
     app.router.add_delete("/v1/responses/{response_id}", adapter._handle_delete_response)
+    app.router.add_get("/api/runs", adapter._handle_list_run_graphs)
+    app.router.add_get("/api/runs/{run_id}", adapter._handle_get_run_graph_snapshot)
+    app.router.add_get("/api/runs/{run_id}/events", adapter._handle_get_run_graph_events)
     return app
 
 
@@ -330,6 +333,61 @@ def adapter():
 @pytest.fixture
 def auth_adapter():
     return _make_adapter(api_key="sk-secret")
+
+
+# ---------------------------------------------------------------------------
+# Persisted RunGraph read endpoints
+# ---------------------------------------------------------------------------
+
+
+class TestRunGraphReadEndpoints:
+    @pytest.mark.asyncio
+    async def test_list_runs_returns_recent_run_dicts(self, adapter):
+        run = MagicMock()
+        run.to_dict.return_value = {"run_id": "run_1", "status": "succeeded"}
+        db = MagicMock()
+        db.list_recent_runs.return_value = [run]
+        adapter._session_db = db
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/api/runs?limit=5")
+            assert resp.status == 200
+            data = await resp.json()
+
+        assert data == {"runs": [{"run_id": "run_1", "status": "succeeded"}]}
+        db.list_recent_runs.assert_called_once_with(limit=5)
+
+    @pytest.mark.asyncio
+    async def test_get_run_snapshot_returns_404_for_missing_run(self, adapter):
+        db = MagicMock()
+        db.get_run_graph_snapshot.return_value = None
+        adapter._session_db = db
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/api/runs/missing")
+            assert resp.status == 404
+            data = await resp.json()
+
+        assert data["error"]["code"] == "run_not_found"
+
+    @pytest.mark.asyncio
+    async def test_get_run_events_returns_tail_after_sequence(self, adapter):
+        event = MagicMock()
+        event.to_dict.return_value = {"event_id": "evt_2", "sequence": 2}
+        db = MagicMock()
+        db.list_run_event_records.return_value = [event]
+        adapter._session_db = db
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/api/runs/run_1/events?limit=3&after_sequence=1")
+            assert resp.status == 200
+            data = await resp.json()
+
+        assert data == {"events": [{"event_id": "evt_2", "sequence": 2}]}
+        db.list_run_event_records.assert_called_once_with("run_1", limit=3, after_sequence=1)
 
 
 # ---------------------------------------------------------------------------

@@ -1817,6 +1817,58 @@ def _(rid, params: dict) -> dict:
         return _err(rid, 5006, str(e))
 
 
+@method("runs.list_recent")
+def _(rid, params: dict) -> dict:
+    db = _get_db()
+    if db is None:
+        return _db_unavailable_error(rid, code=5006)
+    try:
+        limit = max(1, min(int(params.get("limit", 20) or 20), 200))
+        runs = [run.to_dict() for run in db.list_recent_runs(limit=limit)]
+        return _ok(rid, {"runs": runs})
+    except Exception as e:
+        return _err(rid, 5006, str(e))
+
+
+@method("runs.get_snapshot")
+def _(rid, params: dict) -> dict:
+    run_id = (params.get("run_id") or "").strip()
+    if not run_id:
+        return _err(rid, 4001, "run_id required")
+    db = _get_db()
+    if db is None:
+        return _db_unavailable_error(rid, code=5006)
+    try:
+        limit = max(1, min(int(params.get("events_limit", params.get("limit", 200)) or 200), 1000))
+        snapshot = db.get_run_graph_snapshot(run_id, events_limit=limit)
+        if snapshot is None:
+            return _err(rid, 4041, f"run not found: {run_id}")
+        return _ok(rid, snapshot)
+    except Exception as e:
+        return _err(rid, 5006, str(e))
+
+
+@method("runs.events_tail")
+def _(rid, params: dict) -> dict:
+    run_id = (params.get("run_id") or "").strip()
+    if not run_id:
+        return _err(rid, 4001, "run_id required")
+    db = _get_db()
+    if db is None:
+        return _db_unavailable_error(rid, code=5006)
+    try:
+        limit = max(1, min(int(params.get("limit", 200) or 200), 1000))
+        after_raw = params.get("after_sequence")
+        after_sequence = None if after_raw is None else int(after_raw)
+        events = [
+            event.to_dict()
+            for event in db.list_run_event_records(run_id, limit=limit, after_sequence=after_sequence)
+        ]
+        return _ok(rid, {"events": events})
+    except Exception as e:
+        return _err(rid, 5006, str(e))
+
+
 @method("session.most_recent")
 def _(rid, params: dict) -> dict:
     """Return the most recent human-facing session id, or ``None``.

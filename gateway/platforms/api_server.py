@@ -854,6 +854,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_status": {"method": "GET", "path": "/v1/runs/{run_id}"},
                 "run_events": {"method": "GET", "path": "/v1/runs/{run_id}/events"},
                 "run_stop": {"method": "POST", "path": "/v1/runs/{run_id}/stop"},
+                "run_graph_list": {"method": "GET", "path": "/api/runs"},
+                "run_graph_snapshot": {"method": "GET", "path": "/api/runs/{run_id}"},
+                "run_graph_events_tail": {"method": "GET", "path": "/api/runs/{run_id}/events"},
             },
         })
 
@@ -2068,6 +2071,83 @@ class APIServerAdapter(BasePlatformAdapter):
             )
         return job_id, None
 
+    @staticmethod
+    def _query_int(request: "web.Request", name: str, default: int, *, min_value: int = 1, max_value: int = 1000) -> int:
+        try:
+            value = int(request.query.get(name, default) or default)
+        except (TypeError, ValueError):
+            value = default
+        return max(min_value, min(value, max_value))
+
+    async def _handle_list_run_graphs(self, request: "web.Request") -> "web.Response":
+        """GET /api/runs — list persisted RunGraph runs."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        db = self._ensure_session_db()
+        if db is None:
+            return web.json_response(
+                _openai_error("state.db unavailable", code="state_db_unavailable"),
+                status=503,
+            )
+        try:
+            limit = self._query_int(request, "limit", 20, max_value=200)
+            runs = [run.to_dict() for run in db.list_recent_runs(limit=limit)]
+            return web.json_response({"runs": runs})
+        except Exception as e:
+            logger.debug("RunGraph list endpoint failed: %s", e, exc_info=True)
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def _handle_get_run_graph_snapshot(self, request: "web.Request") -> "web.Response":
+        """GET /api/runs/{run_id} — return persisted RunGraph snapshot."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        run_id = request.match_info.get("run_id", "")
+        db = self._ensure_session_db()
+        if db is None:
+            return web.json_response(
+                _openai_error("state.db unavailable", code="state_db_unavailable"),
+                status=503,
+            )
+        try:
+            limit = self._query_int(request, "events_limit", self._query_int(request, "limit", 200), max_value=1000)
+            snapshot = db.get_run_graph_snapshot(run_id, events_limit=limit)
+            if snapshot is None:
+                return web.json_response(
+                    _openai_error(f"Run not found: {run_id}", code="run_not_found"),
+                    status=404,
+                )
+            return web.json_response(snapshot)
+        except Exception as e:
+            logger.debug("RunGraph snapshot endpoint failed: %s", e, exc_info=True)
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def _handle_get_run_graph_events(self, request: "web.Request") -> "web.Response":
+        """GET /api/runs/{run_id}/events — return persisted RunGraph event tail."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        run_id = request.match_info.get("run_id", "")
+        db = self._ensure_session_db()
+        if db is None:
+            return web.json_response(
+                _openai_error("state.db unavailable", code="state_db_unavailable"),
+                status=503,
+            )
+        try:
+            limit = self._query_int(request, "limit", 200, max_value=1000)
+            after_raw = request.query.get("after_sequence")
+            after_sequence = None if after_raw is None else int(after_raw)
+            events = [
+                event.to_dict()
+                for event in db.list_run_event_records(run_id, limit=limit, after_sequence=after_sequence)
+            ]
+            return web.json_response({"events": events})
+        except Exception as e:
+            logger.debug("RunGraph events endpoint failed: %s", e, exc_info=True)
+            return web.json_response({"error": str(e)}, status=500)
+
     async def _handle_list_jobs(self, request: "web.Request") -> "web.Response":
         """GET /api/jobs — list all cron jobs."""
         auth_err = self._check_auth(request)
@@ -2784,6 +2864,10 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_post("/v1/responses", self._handle_responses)
             self._app.router.add_get("/v1/responses/{response_id}", self._handle_get_response)
             self._app.router.add_delete("/v1/responses/{response_id}", self._handle_delete_response)
+            # Persisted RunGraph read API for operator UIs
+            self._app.router.add_get("/api/runs", self._handle_list_run_graphs)
+            self._app.router.add_get("/api/runs/{run_id}", self._handle_get_run_graph_snapshot)
+            self._app.router.add_get("/api/runs/{run_id}/events", self._handle_get_run_graph_events)
             # Cron jobs management API
             self._app.router.add_get("/api/jobs", self._handle_list_jobs)
             self._app.router.add_post("/api/jobs", self._handle_create_job)
