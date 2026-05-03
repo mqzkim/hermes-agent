@@ -321,6 +321,39 @@ class TestSendOrEditMediaStripping:
         assert result is True
         adapter.edit_message.assert_called_once()
 
+    @pytest.mark.asyncio
+    async def test_edit_fallback_updates_message_id_to_new_bot_message(self):
+        """A successful edit fallback must become the new editable target.
+
+        Discord can reject an edit when a stale/foreign message id was used
+        and the adapter then falls back to sending a fresh bot-authored
+        message.  The stream consumer must adopt that new message id;
+        otherwise every subsequent update retries the same uneditable target
+        and produces repeated fallback messages/log warnings.
+        """
+        adapter = MagicMock()
+        adapter.MAX_MESSAGE_LENGTH = 4096
+        adapter.edit_message = AsyncMock(
+            side_effect=[
+                SimpleNamespace(
+                    success=True,
+                    message_id="bot_msg_2",
+                    raw_response={"fallback_from_edit_message_id": "user_msg_1"},
+                ),
+                SimpleNamespace(success=True, message_id="bot_msg_2", raw_response={}),
+            ]
+        )
+
+        consumer = GatewayStreamConsumer(adapter, "chat_123")
+        consumer._message_id = "user_msg_1"
+        consumer._last_sent_text = "old"
+
+        assert await consumer._send_or_edit("first fallback text") is True
+        assert consumer._message_id == "bot_msg_2"
+
+        assert await consumer._send_or_edit("second edit text") is True
+        assert adapter.edit_message.call_args_list[1].kwargs["message_id"] == "bot_msg_2"
+
 
 # ── Integration: full stream run ─────────────────────────────────────────
 
