@@ -2689,6 +2689,52 @@ class BasePlatformAdapter(ABC):
         interrupt_event = self._active_sessions.get(session_key) or asyncio.Event()
         self._active_sessions[session_key] = interrupt_event
         
+        # Discord CEO/request channels can opt into source-message threads:
+        # if an inbound message arrives in the parent channel, create a thread
+        # attached to that exact message before any typing/progress/final sends.
+        # This keeps tool-progress and final answers out of the parent channel.
+        try:
+            platform_value = getattr(getattr(event.source, "platform", None), "value", "")
+            auto_thread_channels = {
+                item.strip()
+                for item in os.getenv(
+                    "HERMES_DISCORD_AUTO_SOURCE_THREAD_CHANNELS",
+                    "1492020965079519292",
+                ).split(",")
+                if item.strip()
+            }
+            if (
+                platform_value == "discord"
+                and not getattr(event.source, "thread_id", None)
+                and str(getattr(event.source, "chat_id", "")) in auto_thread_channels
+                and getattr(event, "raw_message", None) is not None
+                and getattr(event, "message_id", None)
+            ):
+                title_source = (event.text or "요청").replace("\n", " ").strip()
+                thread_name = title_source[:80] or f"request-{event.message_id}"
+                raw_message = event.raw_message
+                if hasattr(raw_message, "create_thread"):
+                    thread = await raw_message.create_thread(
+                        name=thread_name,
+                        auto_archive_duration=1440,
+                    )
+                    event.source.thread_id = str(getattr(thread, "id", "")) or None
+                    logger.info(
+                        "[%s] Created source-message thread %s for chat=%s message=%s",
+                        self.name,
+                        event.source.thread_id,
+                        event.source.chat_id,
+                        event.message_id,
+                    )
+        except Exception as _auto_thread_err:
+            logger.warning(
+                "[%s] Failed to create source-message thread for chat=%s message=%s: %s",
+                self.name,
+                getattr(event.source, "chat_id", "?"),
+                getattr(event, "message_id", "?"),
+                _auto_thread_err,
+            )
+
         # Start continuous typing indicator (refreshes every 2 seconds)
         _thread_metadata = {"thread_id": event.source.thread_id} if event.source.thread_id else None
         _keep_typing_kwargs = {"metadata": _thread_metadata}

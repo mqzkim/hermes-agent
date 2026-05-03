@@ -10,9 +10,9 @@ from gateway.platforms.base import BasePlatformAdapter, MessageEvent, Processing
 from gateway.session import SessionSource, build_session_key
 
 
-class DummyTelegramAdapter(BasePlatformAdapter):
-    def __init__(self):
-        super().__init__(PlatformConfig(enabled=True, token="fake-token"), Platform.TELEGRAM)
+class DummyBaseAdapter(BasePlatformAdapter):
+    def __init__(self, platform: Platform):
+        super().__init__(PlatformConfig(enabled=True, token="fake-token"), platform)
         self.sent = []
         self.typing = []
         self.processing_hooks = []
@@ -48,6 +48,16 @@ class DummyTelegramAdapter(BasePlatformAdapter):
         self.processing_hooks.append(("complete", event.message_id, outcome))
 
 
+class DummyTelegramAdapter(DummyBaseAdapter):
+    def __init__(self):
+        super().__init__(Platform.TELEGRAM)
+
+
+class DummyDiscordAdapter(DummyBaseAdapter):
+    def __init__(self):
+        super().__init__(Platform.DISCORD)
+
+
 def _make_event(chat_id: str, thread_id: str, message_id: str = "1") -> MessageEvent:
     return MessageEvent(
         text="hello",
@@ -59,6 +69,36 @@ def _make_event(chat_id: str, thread_id: str, message_id: str = "1") -> MessageE
         ),
         message_id=message_id,
     )
+
+
+def _make_discord_event(
+    chat_id: str = "1492020965079519292",
+    thread_id: str | None = None,
+    message_id: str = "123",
+    text: str = "source request",
+    raw_message=None,
+) -> MessageEvent:
+    return MessageEvent(
+        text=text,
+        source=SessionSource(
+            platform=Platform.DISCORD,
+            chat_id=chat_id,
+            chat_type="group",
+            thread_id=thread_id,
+        ),
+        raw_message=raw_message,
+        message_id=message_id,
+    )
+
+
+class FakeDiscordRawMessage:
+    def __init__(self, thread_id: str = "thread-1"):
+        self.thread_id = thread_id
+        self.create_thread_calls = []
+
+    async def create_thread(self, **kwargs):
+        self.create_thread_calls.append(kwargs)
+        return SimpleNamespace(id=self.thread_id)
 
 
 class TestBasePlatformTopicSessions:
@@ -144,6 +184,69 @@ class TestBasePlatformTopicSessions:
             ("start", "1"),
             ("complete", "1", ProcessingOutcome.SUCCESS),
         ]
+
+    @pytest.mark.asyncio
+    async def test_process_message_background_creates_discord_source_message_thread(self, monkeypatch):
+        monkeypatch.setenv("HERMES_DISCORD_AUTO_SOURCE_THREAD_CHANNELS", "1492020965079519292")
+        adapter = DummyDiscordAdapter()
+        typing_calls = []
+        raw_message = FakeDiscordRawMessage(thread_id="thread-created")
+
+        async def handler(_event):
+            await asyncio.sleep(0)
+            return "ack"
+
+        async def hold_typing(_chat_id, interval=2.0, metadata=None):
+            typing_calls.append({"chat_id": _chat_id, "metadata": metadata})
+            await asyncio.Event().wait()
+
+        adapter.set_message_handler(handler)
+        adapter._keep_typing = hold_typing
+
+        event = _make_discord_event(raw_message=raw_message, text="긴 요청\n본문")
+        await adapter._process_message_background(event, build_session_key(event.source))
+
+        assert raw_message.create_thread_calls == [
+            {"name": "긴 요청 본문", "auto_archive_duration": 1440}
+        ]
+        assert event.source.thread_id == "thread-created"
+        assert adapter.sent == [
+            {
+                "chat_id": "1492020965079519292",
+                "content": "ack",
+                "reply_to": "123",
+                "metadata": {"thread_id": "thread-created"},
+            }
+        ]
+        assert typing_calls == [
+            {
+                "chat_id": "1492020965079519292",
+                "metadata": {"thread_id": "thread-created"},
+            }
+        ]
+
+    @pytest.mark.asyncio
+    async def test_process_message_background_preserves_existing_discord_thread(self, monkeypatch):
+        monkeypatch.setenv("HERMES_DISCORD_AUTO_SOURCE_THREAD_CHANNELS", "1492020965079519292")
+        adapter = DummyDiscordAdapter()
+        raw_message = FakeDiscordRawMessage(thread_id="should-not-create")
+
+        async def handler(_event):
+            await asyncio.sleep(0)
+            return "ack"
+
+        async def hold_typing(_chat_id, interval=2.0, metadata=None):
+            await asyncio.Event().wait()
+
+        adapter.set_message_handler(handler)
+        adapter._keep_typing = hold_typing
+
+        event = _make_discord_event(raw_message=raw_message, thread_id="existing-thread")
+        await adapter._process_message_background(event, build_session_key(event.source))
+
+        assert raw_message.create_thread_calls == []
+        assert event.source.thread_id == "existing-thread"
+        assert adapter.sent[0]["metadata"] == {"thread_id": "existing-thread"}
 
     @pytest.mark.asyncio
     async def test_process_message_background_marks_total_send_failure_unsuccessful(self):
