@@ -22,6 +22,9 @@ import run_agent
 from run_agent import AIAgent
 from agent.error_classifier import FailoverReason
 from agent.prompt_builder import DEFAULT_AGENT_IDENTITY
+from agent.run_events import RunEventType, RunNodeType
+from agent.run_layers import current_run_graph
+from hermes_state import SessionDB
 
 
 # ---------------------------------------------------------------------------
@@ -2294,6 +2297,80 @@ class TestRunConversation:
         assert result["api_calls"] == 2
         assert mock_handle_function_call.call_args.kwargs["tool_call_id"] == "c1"
         assert mock_handle_function_call.call_args.kwargs["session_id"] == agent.session_id
+
+    def test_run_conversation_persists_run_graph_for_final_response(self, agent, tmp_path):
+        self._setup_agent(agent)
+        db = SessionDB(tmp_path / "state.db")
+        try:
+            db.create_session(session_id=agent.session_id, source="cli")
+            agent._session_db = db
+            resp = _mock_response(content="Final answer", finish_reason="stop")
+            agent.client.chat.completions.create.return_value = resp
+
+            with (
+                patch.object(agent, "_persist_session"),
+                patch.object(agent, "_save_trajectory"),
+                patch.object(agent, "_cleanup_task_resources"),
+            ):
+                result = agent.run_conversation("hello", task_id="task-run-graph")
+
+            assert result["completed"] is True
+            assert result["run_id"]
+            snapshot = db.get_run_graph_snapshot(result["run_id"])
+            assert snapshot is not None
+            assert snapshot["run"]["root_goal"] == "hello"
+            node_types = [node["node_type"] for node in snapshot["nodes"]]
+            assert node_types == [RunNodeType.MODEL_CALL.value]
+            event_types = [event["event_type"] for event in snapshot["events_tail"]]
+            assert RunEventType.RUN_STARTED.value in event_types
+            assert RunEventType.MODEL_REQUEST.value in event_types
+            assert RunEventType.MODEL_RESPONSE.value in event_types
+            assert RunEventType.RUN_SUCCEEDED.value in event_types
+        finally:
+            db.close()
+
+    def test_tool_execution_has_current_run_graph_and_persists_tool_node(self, agent, tmp_path):
+        self._setup_agent(agent)
+        db = SessionDB(tmp_path / "state.db")
+        try:
+            db.create_session(session_id=agent.session_id, source="cli")
+            agent._session_db = db
+            tc = _mock_tool_call(name="web_search", arguments='{"q":"test"}', call_id="c1")
+            resp1 = _mock_response(content="", finish_reason="tool_calls", tool_calls=[tc])
+            resp2 = _mock_response(content="Done searching", finish_reason="stop")
+            agent.client.chat.completions.create.side_effect = [resp1, resp2]
+            seen_run_ids = []
+
+            def _tool_result(*args, **kwargs):
+                graph = current_run_graph()
+                assert graph is not None
+                assert graph.run is not None
+                seen_run_ids.append(graph.run.run_id)
+                return "search result"
+
+            with (
+                patch("run_agent.handle_function_call", side_effect=_tool_result),
+                patch.object(agent, "_persist_session"),
+                patch.object(agent, "_save_trajectory"),
+                patch.object(agent, "_cleanup_task_resources"),
+            ):
+                result = agent.run_conversation("search something", task_id="task-run-graph-tool")
+
+            assert result["completed"] is True
+            assert seen_run_ids == [result["run_id"]]
+            assert current_run_graph() is None
+            snapshot = db.get_run_graph_snapshot(result["run_id"])
+            node_types = [node["node_type"] for node in snapshot["nodes"]]
+            assert node_types.count(RunNodeType.MODEL_CALL.value) == 2
+            assert RunNodeType.TOOL_CALL.value in node_types
+            tool_node = next(node for node in snapshot["nodes"] if node["node_type"] == RunNodeType.TOOL_CALL.value)
+            assert tool_node["inputs"]["tool_call_id"] == "c1"
+            assert tool_node["outputs"]["is_error"] is False
+            event_types = [event["event_type"] for event in snapshot["events_tail"]]
+            assert RunEventType.TOOL_INVOCATION.value in event_types
+            assert RunEventType.TOOL_RESULT.value in event_types
+        finally:
+            db.close()
 
     def test_request_scoped_api_hooks_fire_for_each_api_call(self, agent):
         self._setup_agent(agent)

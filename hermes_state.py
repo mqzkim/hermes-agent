@@ -24,6 +24,8 @@ import time
 from pathlib import Path
 
 from agent.memory_manager import sanitize_context
+from agent.run_artifacts import ArtifactRecord, ArtifactVersionRecord
+from agent.run_events import RunEventRecord, RunNodeRecord, RunRecord
 from hermes_constants import get_hermes_home
 from typing import Any, Callable, Dict, List, Optional, TypeVar
 
@@ -94,10 +96,74 @@ CREATE TABLE IF NOT EXISTS state_meta (
     value TEXT
 );
 
+CREATE TABLE IF NOT EXISTS runs (
+    run_id TEXT PRIMARY KEY,
+    payload TEXT NOT NULL,
+    started_at REAL NOT NULL,
+    session_id TEXT,
+    source TEXT,
+    status TEXT,
+    FOREIGN KEY (session_id) REFERENCES sessions(id)
+);
+
+CREATE TABLE IF NOT EXISTS run_nodes (
+    node_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    started_at REAL NOT NULL,
+    parent_node_id TEXT,
+    node_type TEXT,
+    status TEXT,
+    FOREIGN KEY (run_id) REFERENCES runs(run_id)
+);
+
+CREATE TABLE IF NOT EXISTS run_events (
+    event_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    node_id TEXT,
+    event_type TEXT NOT NULL,
+    sequence INTEGER,
+    timestamp REAL NOT NULL,
+    payload TEXT NOT NULL,
+    FOREIGN KEY (run_id) REFERENCES runs(run_id)
+);
+
+CREATE TABLE IF NOT EXISTS artifacts (
+    artifact_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    producer_node_id TEXT,
+    artifact_type TEXT NOT NULL,
+    title TEXT NOT NULL,
+    content_type TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    payload TEXT NOT NULL,
+    FOREIGN KEY (run_id) REFERENCES runs(run_id)
+);
+
+CREATE TABLE IF NOT EXISTS artifact_versions (
+    version_id TEXT PRIMARY KEY,
+    artifact_id TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    producer_node_id TEXT,
+    version INTEGER NOT NULL,
+    created_at REAL NOT NULL,
+    payload TEXT NOT NULL,
+    FOREIGN KEY (artifact_id) REFERENCES artifacts(artifact_id),
+    FOREIGN KEY (run_id) REFERENCES runs(run_id),
+    UNIQUE (artifact_id, version)
+);
+
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp);
+CREATE INDEX IF NOT EXISTS idx_runs_started ON runs(started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_runs_session ON runs(session_id, started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_run_nodes_run ON run_nodes(run_id, started_at);
+CREATE INDEX IF NOT EXISTS idx_run_events_run ON run_events(run_id, sequence, timestamp);
+CREATE INDEX IF NOT EXISTS idx_artifacts_run ON artifacts(run_id, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_artifact_versions_artifact ON artifact_versions(artifact_id, version DESC);
 """
 
 FTS_SQL = """
@@ -509,6 +575,296 @@ class SessionDB:
             cursor.executescript(FTS_TRIGRAM_SQL)
 
         self._conn.commit()
+
+    # =========================================================================
+    # RunGraph persistence
+    # =========================================================================
+
+    @staticmethod
+    def _json_dumps(data: Dict[str, Any]) -> str:
+        return json.dumps(data, ensure_ascii=False, sort_keys=True)
+
+    @staticmethod
+    def _json_loads_dict(raw: str | None) -> Dict[str, Any]:
+        if not raw:
+            return {}
+        try:
+            loaded = json.loads(raw)
+            return loaded if isinstance(loaded, dict) else {}
+        except (json.JSONDecodeError, TypeError):
+            return {}
+
+    @staticmethod
+    def _run_payload(record: RunRecord) -> Dict[str, Any]:
+        return record.to_dict()
+
+    @staticmethod
+    def _node_payload(record: RunNodeRecord) -> Dict[str, Any]:
+        return record.to_dict()
+
+    @staticmethod
+    def _event_payload(record: RunEventRecord) -> Dict[str, Any]:
+        return record.to_dict()
+
+    def save_run_record(self, record: RunRecord) -> None:
+        payload = self._run_payload(record)
+
+        def _do(conn):
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO runs
+                    (run_id, payload, started_at, session_id, source, status)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record.run_id,
+                    self._json_dumps(payload),
+                    record.started_at,
+                    record.session_id,
+                    record.source,
+                    record.status.value,
+                ),
+            )
+
+        self._execute_write(_do)
+
+    def get_run_record(self, run_id: str) -> RunRecord | None:
+        row = self._conn.execute("SELECT payload FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+        if row is None:
+            return None
+        return RunRecord.from_dict(self._json_loads_dict(row["payload"]))
+
+    def list_recent_runs(self, limit: int = 20) -> List[RunRecord]:
+        safe_limit = max(1, min(int(limit or 20), 500))
+        rows = self._conn.execute(
+            "SELECT payload FROM runs ORDER BY started_at DESC LIMIT ?",
+            (safe_limit,),
+        ).fetchall()
+        return [RunRecord.from_dict(self._json_loads_dict(row["payload"])) for row in rows]
+
+    def save_run_node_record(self, record: RunNodeRecord) -> None:
+        payload = self._node_payload(record)
+
+        def _do(conn):
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO run_nodes
+                    (node_id, run_id, payload, started_at, parent_node_id, node_type, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record.node_id,
+                    record.run_id,
+                    self._json_dumps(payload),
+                    record.started_at,
+                    record.parent_node_id,
+                    record.node_type.value,
+                    record.status.value,
+                ),
+            )
+
+        self._execute_write(_do)
+
+    def get_run_node_record(self, node_id: str) -> RunNodeRecord | None:
+        row = self._conn.execute("SELECT payload FROM run_nodes WHERE node_id = ?", (node_id,)).fetchone()
+        if row is None:
+            return None
+        return RunNodeRecord.from_dict(self._json_loads_dict(row["payload"]))
+
+    def list_run_node_records(self, run_id: str) -> List[RunNodeRecord]:
+        rows = self._conn.execute(
+            "SELECT payload FROM run_nodes WHERE run_id = ? ORDER BY started_at, node_id",
+            (run_id,),
+        ).fetchall()
+        return [RunNodeRecord.from_dict(self._json_loads_dict(row["payload"])) for row in rows]
+
+    def append_run_event_record(self, record: RunEventRecord) -> None:
+        payload = self._event_payload(record)
+
+        def _do(conn):
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO run_events
+                    (event_id, run_id, node_id, event_type, sequence, timestamp, payload)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record.event_id,
+                    record.run_id,
+                    record.node_id,
+                    record.event_type.value,
+                    record.sequence,
+                    record.timestamp,
+                    self._json_dumps(payload),
+                ),
+            )
+
+        self._execute_write(_do)
+
+    def list_run_event_records(
+        self,
+        run_id: str,
+        limit: int = 200,
+        after_sequence: int | None = None,
+    ) -> List[RunEventRecord]:
+        safe_limit = max(1, min(int(limit or 200), 5000))
+        params: list[Any] = [run_id]
+        where = "run_id = ?"
+        if after_sequence is not None:
+            where += " AND COALESCE(sequence, -1) > ?"
+            params.append(after_sequence)
+        params.append(safe_limit)
+        rows = self._conn.execute(
+            f"""
+            SELECT payload FROM run_events
+            WHERE {where}
+            ORDER BY COALESCE(sequence, 9223372036854775807), timestamp, event_id
+            LIMIT ?
+            """,
+            tuple(params),
+        ).fetchall()
+        return [RunEventRecord.from_dict(self._json_loads_dict(row["payload"])) for row in rows]
+
+    def tail_run_event_records(self, run_id: str, limit: int = 200) -> List[RunEventRecord]:
+        safe_limit = max(1, min(int(limit or 200), 5000))
+        rows = self._conn.execute(
+            """
+            SELECT payload FROM run_events
+            WHERE run_id = ?
+            ORDER BY COALESCE(sequence, 9223372036854775807) DESC, timestamp DESC, event_id DESC
+            LIMIT ?
+            """,
+            (run_id, safe_limit),
+        ).fetchall()
+        events = [RunEventRecord.from_dict(self._json_loads_dict(row["payload"])) for row in rows]
+        events.reverse()
+        return events
+
+    @staticmethod
+    def _node_tree_dicts(nodes: List[RunNodeRecord]) -> List[Dict[str, Any]]:
+        items = []
+        by_id: Dict[str, Dict[str, Any]] = {}
+        roots: List[Dict[str, Any]] = []
+        for node in nodes:
+            item = node.to_dict()
+            item["children"] = []
+            items.append(item)
+            by_id[node.node_id] = item
+        for node, item in zip(nodes, items):
+            if node.parent_node_id and node.parent_node_id in by_id:
+                by_id[node.parent_node_id]["children"].append(item)
+            else:
+                roots.append(item)
+        return roots
+
+    def get_run_graph_snapshot(self, run_id: str, events_limit: int = 200) -> Dict[str, Any] | None:
+        run = self.get_run_record(run_id)
+        if run is None:
+            return None
+        nodes = self.list_run_node_records(run_id)
+        artifacts = []
+        for artifact in self.list_artifact_records(run_id):
+            artifact_dict = artifact.to_dict()
+            latest = self.get_latest_artifact_version_record(artifact.artifact_id)
+            artifact_dict["latest_version"] = latest.to_dict() if latest is not None else None
+            artifacts.append(artifact_dict)
+        return {
+            "run": run.to_dict(),
+            "nodes": [node.to_dict() for node in nodes],
+            "node_tree": self._node_tree_dicts(nodes),
+            "events_tail": [event.to_dict() for event in self.tail_run_event_records(run_id, events_limit)],
+            "artifacts": artifacts,
+        }
+
+    def save_artifact_record(self, record: ArtifactRecord) -> None:
+        payload = record.to_dict()
+
+        def _do(conn):
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO artifacts
+                    (artifact_id, run_id, producer_node_id, artifact_type, title, content_type, created_at, updated_at, payload)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record.artifact_id,
+                    record.run_id,
+                    record.producer_node_id,
+                    record.artifact_type.value,
+                    record.title,
+                    record.content_type,
+                    record.created_at,
+                    record.updated_at,
+                    self._json_dumps(payload),
+                ),
+            )
+
+        self._execute_write(_do)
+
+    def list_artifact_records(self, run_id: str) -> List[ArtifactRecord]:
+        rows = self._conn.execute(
+            "SELECT payload FROM artifacts WHERE run_id = ? ORDER BY updated_at DESC, artifact_id",
+            (run_id,),
+        ).fetchall()
+        return [ArtifactRecord.from_dict(self._json_loads_dict(row["payload"])) for row in rows]
+
+    def append_artifact_version_record(self, record: ArtifactVersionRecord) -> None:
+        payload = record.to_dict()
+
+        def _do(conn):
+            conn.execute(
+                """
+                INSERT INTO artifact_versions
+                    (version_id, artifact_id, run_id, producer_node_id, version, created_at, payload)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(artifact_id, version) DO UPDATE SET
+                    version_id = excluded.version_id,
+                    run_id = excluded.run_id,
+                    producer_node_id = excluded.producer_node_id,
+                    created_at = excluded.created_at,
+                    payload = excluded.payload
+                """,
+                (
+                    record.version_id,
+                    record.artifact_id,
+                    record.run_id,
+                    record.producer_node_id,
+                    record.version,
+                    record.created_at,
+                    self._json_dumps(payload),
+                ),
+            )
+            conn.execute(
+                """
+                UPDATE artifacts
+                SET updated_at = MAX(updated_at, ?)
+                WHERE artifact_id = ?
+                """,
+                (record.created_at, record.artifact_id),
+            )
+
+        self._execute_write(_do)
+
+    def list_artifact_version_records(self, artifact_id: str) -> List[ArtifactVersionRecord]:
+        rows = self._conn.execute(
+            "SELECT payload FROM artifact_versions WHERE artifact_id = ? ORDER BY version, created_at, version_id",
+            (artifact_id,),
+        ).fetchall()
+        return [ArtifactVersionRecord.from_dict(self._json_loads_dict(row["payload"])) for row in rows]
+
+    def get_latest_artifact_version_record(self, artifact_id: str) -> ArtifactVersionRecord | None:
+        row = self._conn.execute(
+            """
+            SELECT payload FROM artifact_versions
+            WHERE artifact_id = ?
+            ORDER BY version DESC, created_at DESC, version_id DESC
+            LIMIT 1
+            """,
+            (artifact_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return ArtifactVersionRecord.from_dict(self._json_loads_dict(row["payload"]))
 
     # =========================================================================
     # Session lifecycle

@@ -18,6 +18,9 @@ import time
 import unittest
 from unittest.mock import MagicMock, patch
 
+from agent.run_events import RunEventType, RunNodeType, RunStatus
+from agent.run_graph import RunGraph
+from agent.run_layers import run_graph_context
 from tools.delegate_tool import (
     DELEGATE_BLOCKED_TOOLS,
     DELEGATE_TASK_SCHEMA,
@@ -212,6 +215,58 @@ class TestDelegateTask(unittest.TestCase):
         result = json.loads(delegate_task(goal="Break things", parent_agent=parent))
         self.assertEqual(result["results"][0]["status"], "error")
         self.assertIn("Something broke", result["results"][0]["error"])
+
+    @patch("tools.delegate_tool._run_single_child")
+    def test_single_task_records_subagent_node_in_current_run_graph(self, mock_run):
+        mock_run.return_value = {
+            "task_index": 0,
+            "status": "completed",
+            "summary": "Done!",
+            "api_calls": 1,
+            "duration_seconds": 0.1,
+        }
+        parent = _make_mock_parent()
+        child = MagicMock()
+        child.model = "anthropic/claude-sonnet-4"
+        graph = RunGraph.start(session_id=None, source="cli", root_goal="parent")
+
+        with patch("tools.delegate_tool._build_child_agent", return_value=child), run_graph_context(graph):
+            result = json.loads(delegate_task(goal="Fix tests", parent_agent=parent))
+
+        self.assertEqual(result["results"][0]["status"], "completed")
+        subagent_nodes = [node for node in graph.nodes.values() if node.node_type == RunNodeType.SUBAGENT]
+        self.assertEqual(len(subagent_nodes), 1)
+        self.assertEqual(subagent_nodes[0].status, RunStatus.SUCCEEDED)
+        self.assertEqual(subagent_nodes[0].inputs["task_index"], 0)
+        self.assertEqual(subagent_nodes[0].inputs["goal"], "Fix tests")
+        self.assertEqual(child._parent_run_id, graph.run.run_id)
+        self.assertEqual(child._parent_run_node_id, subagent_nodes[0].node_id)
+        self.assertIn(RunEventType.SUBAGENT_SPAWNED, [event.event_type for event in graph.events])
+        self.assertIn(RunEventType.SUBAGENT_COMPLETED, [event.event_type for event in graph.events])
+
+    @patch("tools.delegate_tool._run_single_child")
+    def test_failed_child_marks_subagent_node_failed(self, mock_run):
+        mock_run.return_value = {
+            "task_index": 0,
+            "status": "error",
+            "summary": None,
+            "error": "Something broke",
+            "api_calls": 0,
+            "duration_seconds": 0.1,
+        }
+        parent = _make_mock_parent()
+        graph = RunGraph.start(session_id=None, source="cli", root_goal="parent")
+
+        with patch("tools.delegate_tool._build_child_agent", return_value=MagicMock()), run_graph_context(graph):
+            result = json.loads(delegate_task(goal="Break things", parent_agent=parent))
+
+        self.assertEqual(result["results"][0]["status"], "error")
+        subagent_node = next(node for node in graph.nodes.values() if node.node_type == RunNodeType.SUBAGENT)
+        self.assertEqual(subagent_node.status, RunStatus.FAILED)
+        self.assertIn("Something broke", subagent_node.error)
+        completed_event = [event for event in graph.events if event.event_type == RunEventType.SUBAGENT_COMPLETED][-1]
+        self.assertEqual(completed_event.payload["status"], "error")
+        self.assertEqual(completed_event.payload["error"], "Something broke")
 
     def test_depth_increments(self):
         """Verify child gets parent's depth + 1."""
