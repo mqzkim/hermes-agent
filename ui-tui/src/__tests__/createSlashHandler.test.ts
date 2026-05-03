@@ -128,13 +128,95 @@ describe('createSlashHandler', () => {
 
   it('shows usage for an unknown /skills subcommand', () => {
     const ctx = buildCtx()
-
     createSlashHandler(ctx)('/skills zzz')
     expect(ctx.gateway.rpc).not.toHaveBeenCalled()
     expect(ctx.transcript.sys).toHaveBeenCalledWith(expect.stringContaining('usage: /skills'))
   })
 
-  it('cycles details mode and persists it', async () => {
+  it('renders recent RunGraph runs as a local panel', async () => {
+    const rpc = vi.fn(() =>
+      Promise.resolve({
+        runs: [
+          {
+            run_id: 'run_1234567890abcdef',
+            root_goal: 'inspect the runtime graph',
+            source: 'cli',
+            started_at: 1_700_000_000,
+            status: 'succeeded'
+          }
+        ]
+      })
+    )
+
+    const ctx = buildCtx({ gateway: { ...buildGateway(), rpc } })
+
+    expect(createSlashHandler(ctx)('/runs')).toBe(true)
+
+    await vi.waitFor(() => {
+      expect(rpc).toHaveBeenCalledWith('runs.list_recent', { limit: 12 })
+      expect(ctx.transcript.panel).toHaveBeenCalledWith(
+        'RunGraph',
+        expect.arrayContaining([
+          expect.objectContaining({ title: 'Recent runs' })
+        ])
+      )
+    })
+  })
+
+  it('renders a RunGraph snapshot panel for /runs <run_id>', async () => {
+    const rpc = vi.fn(() =>
+      Promise.resolve({
+        events_tail: [{ event_id: 'evt_1', event_type: 'run_started', sequence: 1 }],
+        nodes: [
+          { node_id: 'node_1', node_type: 'model_call', status: 'succeeded', title: 'model call #1' },
+          { node_id: 'node_2', node_type: 'tool_call', status: 'succeeded', title: 'tool 1: web_search' }
+        ],
+        run: {
+          run_id: 'run_full_1',
+          root_goal: 'do the thing',
+          session_id: 'sid-1',
+          source: 'cli',
+          started_at: 1_700_000_000,
+          status: 'succeeded'
+        }
+      })
+    )
+
+    const ctx = buildCtx({ gateway: { ...buildGateway(), rpc } })
+
+    expect(createSlashHandler(ctx)('/runs run_full_1')).toBe(true)
+
+    await vi.waitFor(() => {
+      expect(rpc).toHaveBeenCalledWith('runs.get_snapshot', { events_limit: 50, run_id: 'run_full_1' })
+      expect(ctx.transcript.panel).toHaveBeenCalledWith(
+        'RunGraph snapshot · run_full_1',
+        expect.arrayContaining([
+          expect.objectContaining({ title: 'Run' }),
+          expect.objectContaining({ title: 'Node types' })
+        ])
+      )
+    })
+  })
+
+  it('renders a RunGraph event tail panel for /runs <run_id> events', async () => {
+    const rpc = vi.fn(() =>
+      Promise.resolve({ events: [{ event_id: 'evt_1', event_type: 'tool_result', node_id: 'node_1', sequence: 7 }] })
+    )
+
+    const ctx = buildCtx({ gateway: { ...buildGateway(), rpc } })
+
+    expect(createSlashHandler(ctx)('/runs run_full_1 events')).toBe(true)
+
+    await vi.waitFor(() => {
+      expect(rpc).toHaveBeenCalledWith('runs.events_tail', { limit: 50, run_id: 'run_full_1' })
+      expect(ctx.transcript.panel).toHaveBeenCalledWith(
+        'RunGraph events · run_full_1',
+        expect.arrayContaining([expect.objectContaining({ title: 'run_full_1' })])
+      )
+    })
+  })
+
+  it('routes /details through config.set', () => {
     const ctx = buildCtx()
 
     expect(getUiState().detailsMode).toBe('collapsed')

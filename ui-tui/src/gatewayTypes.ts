@@ -136,6 +136,51 @@ export interface SessionMostRecentResponse {
   title?: string
 }
 
+export interface RunGraphRun {
+  ended_at?: null | number
+  model?: null | string
+  provider?: null | string
+  root_goal?: string
+  run_id: string
+  session_id?: null | string
+  source?: string
+  started_at?: number
+  status?: string
+}
+
+export interface RunGraphNode {
+  inputs?: Record<string, unknown>
+  node_id: string
+  node_type?: string
+  outputs?: Record<string, unknown>
+  status?: string
+  title?: string
+}
+
+export interface RunGraphEvent {
+  event_id: string
+  event_type?: string
+  node_id?: null | string
+  sequence?: null | number
+  timestamp?: number
+}
+
+export interface RunGraphListResponse {
+  runs?: RunGraphRun[]
+}
+
+export interface RunGraphSnapshotResponse {
+  artifacts?: unknown[]
+  events_tail?: RunGraphEvent[]
+  node_tree?: RunGraphNode[]
+  nodes?: RunGraphNode[]
+  run?: RunGraphRun
+}
+
+export interface RunGraphEventsResponse {
+  events?: RunGraphEvent[]
+}
+
 export interface SessionTitleResponse {
   pending?: boolean
   session_key?: string
